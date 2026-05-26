@@ -1,0 +1,4 @@
+dependencies {
+    api project(':rocksdb-common')
+    api project(':rocksdb-manifest')
+}
