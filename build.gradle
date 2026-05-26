@@ -1,0 +1,78 @@
+allprojects {
+    group = 'com.hkg.rocksdb'
+    version = '0.1.0-SNAPSHOT'
+
+    repositories {
+        mavenCentral()
+    }
+}
+
+subprojects {
+    apply plugin: 'java-library'
+
+    java {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    dependencies {
+        testImplementation platform('org.junit:junit-bom:5.10.2')
+        testImplementation 'org.junit.jupiter:junit-jupiter'
+        testImplementation 'org.assertj:assertj-core:3.25.3'
+        testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    }
+
+    test {
+        useJUnitPlatform()
+    }
+
+    compileJava.options.encoding = 'UTF-8'
+    compileTestJava.options.encoding = 'UTF-8'
+}
+
+// ----------------------------------------------------------------------------
+// Module dependency wiring (matches docs/architecture.md)
+//
+// Active modules (carry the ported leveldb-java code = Phase 1+2 of the
+// RocksDB plan):  common, memtable, wal, bloom, sstable-blockbased,
+// manifest, block-cache, compaction-leveled, engine, tools, test-cluster, cli.
+//
+// Stub modules (reserved for later CPs; declared empty so the multi-project
+// graph is stable):  sstable-api, compaction-api, compaction-tiered,
+// compaction-fifo, rate-limiter, column-family, integrity, error-handling,
+// runtime.
+// ----------------------------------------------------------------------------
+
+project(':rocksdb-memtable')             { dependencies { api project(':rocksdb-common') } }
+project(':rocksdb-wal')                  { dependencies { api project(':rocksdb-common') } }
+project(':rocksdb-bloom')                { dependencies { api project(':rocksdb-common') } }
+project(':rocksdb-sstable-blockbased')   { dependencies { api project(':rocksdb-common'); api project(':rocksdb-bloom'); api project(':rocksdb-block-cache') } }
+project(':rocksdb-manifest')             { dependencies { api project(':rocksdb-common'); api project(':rocksdb-wal') } }
+project(':rocksdb-compaction-leveled')   { dependencies { api project(':rocksdb-common'); api project(':rocksdb-sstable-blockbased'); api project(':rocksdb-manifest') } }
+project(':rocksdb-block-cache')          { dependencies { api project(':rocksdb-common') } }
+project(':rocksdb-engine') {
+    dependencies {
+        api project(':rocksdb-common')
+        api project(':rocksdb-memtable')
+        api project(':rocksdb-wal')
+        api project(':rocksdb-sstable-blockbased')
+        api project(':rocksdb-bloom')
+        api project(':rocksdb-manifest')
+        api project(':rocksdb-compaction-leveled')
+        api project(':rocksdb-block-cache')
+    }
+}
+project(':rocksdb-tools')         { dependencies { api project(':rocksdb-engine') } }
+project(':rocksdb-test-cluster')  { dependencies { api project(':rocksdb-engine'); api project(':rocksdb-tools') } }
+project(':rocksdb-cli')           { dependencies { api project(':rocksdb-engine'); api project(':rocksdb-tools') } }
+
+// Stub modules — no dependencies declared until their first CP lands.
+project(':rocksdb-sstable-api')        { /* CP 1 of the RocksDB plan; lifted-API placeholder */ }
+project(':rocksdb-compaction-api')     { /* compaction-style interface placeholder */ }
+project(':rocksdb-compaction-tiered')  { /* CP 11 — size-tiered / universal */ }
+project(':rocksdb-compaction-fifo')    { /* CP 12 — FIFO */ }
+project(':rocksdb-rate-limiter')       { /* CP 13 — shared TokenBucketRateLimiter */ }
+project(':rocksdb-column-family')      { /* CP 14 — ColumnFamilyRegistry */ }
+project(':rocksdb-integrity')          { /* CPs 19-21 — file + handoff + KV checksums */ }
+project(':rocksdb-error-handling')     { /* CP 22 — SeverityClassifier + read-only latch */ }
+project(':rocksdb-runtime')            { /* Phase 2 CP 9 of original plan — HTTP demo */ }

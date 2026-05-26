@@ -1,0 +1,27 @@
+rootProject.name = 'rocksdb-java'
+
+// Ported from leveldb-java (its CPs 1-12 cover the RocksDB plan's Phases 1-2).
+include 'rocksdb-common'
+include 'rocksdb-memtable'
+include 'rocksdb-wal'
+include 'rocksdb-bloom'
+include 'rocksdb-sstable-api'
+include 'rocksdb-sstable-blockbased'
+include 'rocksdb-manifest'
+include 'rocksdb-block-cache'
+include 'rocksdb-compaction-api'
+include 'rocksdb-compaction-leveled'
+
+// Reserved for Phase 3+ — empty stubs for now; each lights up at the CP noted.
+include 'rocksdb-compaction-tiered'      // CP 11
+include 'rocksdb-compaction-fifo'        // CP 12
+include 'rocksdb-rate-limiter'           // CP 13
+include 'rocksdb-column-family'          // CP 14
+include 'rocksdb-integrity'              // CPs 19-21
+include 'rocksdb-error-handling'         // CP 22
+include 'rocksdb-runtime'                // Phase 2 CP 9 — HTTP demo wrapper
+
+include 'rocksdb-engine'
+include 'rocksdb-tools'
+include 'rocksdb-test-cluster'
+include 'rocksdb-cli'
