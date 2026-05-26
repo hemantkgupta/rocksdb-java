@@ -17,6 +17,9 @@ import com.hkg.rocksdb.compaction.CompactionExecutor;
 import com.hkg.rocksdb.compaction.CompactionJob;
 import com.hkg.rocksdb.compaction.Compactor;
 import com.hkg.rocksdb.compaction.LeveledCompactionPicker;
+import com.hkg.rocksdb.ratelimiter.Priority;
+import com.hkg.rocksdb.ratelimiter.RateLimiter;
+import com.hkg.rocksdb.sstable.WriteHook;
 import com.hkg.rocksdb.manifest.FileMetadata;
 import com.hkg.rocksdb.manifest.Version;
 import com.hkg.rocksdb.manifest.VersionEdit;
@@ -81,12 +84,15 @@ public final class RocksDb implements KvEngine {
     private final CompactionExecutor compactionExecutor;
     /** File numbers currently being read by a compaction worker; consulted by the picker to avoid overlap. */
     private final Set<FileNumber> inFlightFiles = ConcurrentHashMap.newKeySet();
+    /** Optional shared rate limiter. When non-null, compaction I/O is paced at block granularity. */
+    private final RateLimiter rateLimiter;
 
     private RocksDb(Path dbDir, VersionSet versions, SkipListMemTable mt,
                      LogWriter walWriter, FileNumber walNumber,
                      ConcurrentHashMap<FileNumber, BlockBasedTableReader> tables,
                      AtomicLong nextSequence, boolean compressOutput,
-                     BlockCache blockCache, CompactionExecutor compactionExecutor) {
+                     BlockCache blockCache, CompactionExecutor compactionExecutor,
+                     RateLimiter rateLimiter) {
         this.dbDir = dbDir;
         this.versions = versions;
         this.activeMemTable = mt;
@@ -97,6 +103,7 @@ public final class RocksDb implements KvEngine {
         this.compressOutput = compressOutput;
         this.blockCache = blockCache;
         this.compactionExecutor = compactionExecutor;
+        this.rateLimiter = rateLimiter;
     }
 
     /**
@@ -107,32 +114,41 @@ public final class RocksDb implements KvEngine {
      * separately by {@link #recoverWal(Path)} — wired up in CP 9.
      */
     public static RocksDb open(Path dbDir) throws IOException {
-        return open(dbDir, true, new LruBlockCache(Constants.BLOCK_CACHE_DEFAULT_BYTES), 1);
+        return open(dbDir, true, new LruBlockCache(Constants.BLOCK_CACHE_DEFAULT_BYTES), 1, null);
     }
 
     public static RocksDb open(Path dbDir, boolean compressOutput) throws IOException {
-        return open(dbDir, compressOutput, new LruBlockCache(Constants.BLOCK_CACHE_DEFAULT_BYTES), 1);
+        return open(dbDir, compressOutput, new LruBlockCache(Constants.BLOCK_CACHE_DEFAULT_BYTES), 1, null);
     }
 
     public static RocksDb open(Path dbDir, boolean compressOutput, BlockCache blockCache)
         throws IOException {
-        return open(dbDir, compressOutput, blockCache, 1);
+        return open(dbDir, compressOutput, blockCache, 1, null);
+    }
+
+    public static RocksDb open(Path dbDir, boolean compressOutput, BlockCache blockCache,
+                                int compactionThreads)
+        throws IOException {
+        return open(dbDir, compressOutput, blockCache, compactionThreads, null);
     }
 
     /**
-     * Open the engine with an explicit {@link BlockCache} and a fixed-size pool
-     * of compaction worker threads. With {@code compactionThreads = 1} the
-     * engine behaves like LevelDB 2011 (one job at a time); with
-     * {@code compactionThreads > 1} the
+     * Open the engine with an explicit {@link BlockCache}, a fixed-size pool
+     * of compaction worker threads, and an optional {@link RateLimiter} that
+     * paces every compaction worker's block writes at {@link Priority#LOW}.
+     *
+     * <p>With {@code compactionThreads = 1} the engine behaves like LevelDB
+     * 2011 (one job at a time); with {@code compactionThreads > 1} the
      * {@link com.hkg.rocksdb.compaction.LeveledCompactionPicker#pickMultiple
      * picker} chooses several non-overlapping jobs that workers execute in
-     * parallel.
+     * parallel. With {@code rateLimiter = null}, compaction I/O runs
+     * un-throttled (LevelDB-era behaviour).
      *
-     * <p>The cache and the executor are per-engine; cross-instance sharing
-     * (RocksDB plan CPs 24-25) is out of scope here.
+     * <p>The cache, executor, and rate limiter are per-engine; cross-instance
+     * sharing of the rate limiter (RocksDB plan CP 24) is out of scope here.
      */
     public static RocksDb open(Path dbDir, boolean compressOutput, BlockCache blockCache,
-                                int compactionThreads)
+                                int compactionThreads, RateLimiter rateLimiter)
         throws IOException {
         Files.createDirectories(dbDir);
         boolean freshDb = !Files.exists(dbDir.resolve("CURRENT"));
@@ -183,7 +199,7 @@ public final class RocksDb implements KvEngine {
         AtomicLong seq = new AtomicLong(maxSeq + 1L);
         CompactionExecutor executor = new CompactionExecutor(compactionThreads);
         RocksDb db = new RocksDb(dbDir, vs, recoveredMt, wal,
-            new FileNumber(walNum), tables, seq, compressOutput, blockCache, executor);
+            new FileNumber(walNum), tables, seq, compressOutput, blockCache, executor, rateLimiter);
 
         // If we recovered any in-memory state, persist it as an L0 SSTable so the old WAL
         // can be safely deleted. doFlush() opens a fresh WAL of its own and deletes the
@@ -507,12 +523,14 @@ public final class RocksDb implements KvEngine {
                 throw new UncheckedIOException(e);
             }
         });
+        WriteHook compactionHook = rateLimiterHookFor(Priority.LOW);
         for (CompactionJob job : jobs) {
             futures.add(compactionExecutor.submit(job, oldestLive,
                 Constants.SST_FILE_TARGET_SIZE_BYTES, dbDir,
                 () -> new FileNumber(allocCounter.getAndIncrement()),
                 opener,
-                compressOutput));
+                compressOutput,
+                compactionHook));
         }
 
         // Wait for each job to finish, then apply its VersionEdits + cleanup.
@@ -595,6 +613,29 @@ public final class RocksDb implements KvEngine {
     /** Shared block cache used by every SSTable reader this engine owns. */
     public BlockCache blockCache() {
         return blockCache;
+    }
+
+    /** Rate limiter pacing compaction I/O, or {@code null} if no throttling is configured. */
+    public RateLimiter rateLimiter() {
+        return rateLimiter;
+    }
+
+    /**
+     * Build a {@link WriteHook} that requests {@code bytes} tokens from this
+     * engine's {@link #rateLimiter} at {@code priority}. Returns
+     * {@link WriteHook#NO_OP} when no limiter is configured — the un-throttled
+     * path the LevelDB-era stress test exercises.
+     */
+    private WriteHook rateLimiterHookFor(Priority priority) {
+        if (rateLimiter == null) return WriteHook.NO_OP;
+        return bytes -> {
+            try {
+                rateLimiter.request(bytes, priority);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IOException("interrupted waiting for rate limiter", ie);
+            }
+        };
     }
 
     public long lastSequence() {

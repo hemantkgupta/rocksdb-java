@@ -51,6 +51,7 @@ public final class BlockBasedTableWriter implements Closeable {
 
     private final FileChannel channel;
     private final boolean compressBlocks;
+    private final WriteHook writeHook;
     private final BlockBuilder indexBlock = new BlockBuilder();
     private final BloomFilter.Builder bloomBuilder = new BloomFilter.Builder();
     private final CRC32 crc = new CRC32();
@@ -62,22 +63,34 @@ public final class BlockBasedTableWriter implements Closeable {
     private long totalEntries = 0;
     private boolean finished = false;
 
-    private BlockBasedTableWriter(FileChannel channel, boolean compressBlocks) {
+    private BlockBasedTableWriter(FileChannel channel, boolean compressBlocks, WriteHook writeHook) {
         this.channel = channel;
         this.compressBlocks = compressBlocks;
+        this.writeHook = writeHook == null ? WriteHook.NO_OP : writeHook;
     }
 
     /** Open a new SSTable file for writing. Truncates any existing file. */
     public static BlockBasedTableWriter open(Path path) throws IOException {
-        return open(path, true);
+        return open(path, true, WriteHook.NO_OP);
     }
 
     public static BlockBasedTableWriter open(Path path, boolean compressBlocks) throws IOException {
+        return open(path, compressBlocks, WriteHook.NO_OP);
+    }
+
+    /**
+     * Open with a {@link WriteHook} invoked once per on-disk block immediately
+     * before that block's bytes are written. The rate-limited compaction path
+     * passes a hook that calls {@code RateLimiter.request(bytes, LOW)} so
+     * compaction writers are paced at block granularity.
+     */
+    public static BlockBasedTableWriter open(Path path, boolean compressBlocks, WriteHook hook)
+        throws IOException {
         FileChannel ch = FileChannel.open(path,
             StandardOpenOption.CREATE,
             StandardOpenOption.WRITE,
             StandardOpenOption.TRUNCATE_EXISTING);
-        return new BlockBasedTableWriter(ch, compressBlocks);
+        return new BlockBasedTableWriter(ch, compressBlocks, hook);
     }
 
     public void add(InternalKey key, byte[] value) throws IOException {
@@ -166,6 +179,10 @@ public final class BlockBasedTableWriter implements Closeable {
                 compType = Compression.TYPE_DEFLATE;
             }
         }
+        // Pace the write at block granularity. NO_OP is the default; the rate-limited path
+        // wires the engine's TokenBucketRateLimiter behind this hook so a compaction worker
+        // blocks until enough budget is available before any block bytes hit the channel.
+        writeHook.beforeBlockWrite(body.length + 1 + 4);
         long offset = fileOffset;
         writeFully(ByteBuffer.wrap(body));
         writeFully(ByteBuffer.wrap(new byte[] {compType}));

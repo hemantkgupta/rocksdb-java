@@ -1,6 +1,7 @@
 package com.hkg.rocksdb.compaction;
 
 import com.hkg.rocksdb.manifest.FileMetadata;
+import com.hkg.rocksdb.sstable.WriteHook;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -58,8 +59,22 @@ public final class CompactionExecutor implements AutoCloseable {
                                               Compactor.FileNumberAllocator allocator,
                                               Compactor.ReaderOpener opener,
                                               boolean compressBlocks) {
+        return submit(job, oldestLiveSeq, targetFileSize, dbDir, allocator, opener,
+            compressBlocks, WriteHook.NO_OP);
+    }
+
+    /** Submit with an explicit {@link WriteHook} for rate-limited compaction I/O. */
+    public Future<List<FileMetadata>> submit(CompactionJob job,
+                                              long oldestLiveSeq,
+                                              long targetFileSize,
+                                              Path dbDir,
+                                              Compactor.FileNumberAllocator allocator,
+                                              Compactor.ReaderOpener opener,
+                                              boolean compressBlocks,
+                                              WriteHook writeHook) {
         Callable<List<FileMetadata>> task = () -> Compactor.run(
-            job, oldestLiveSeq, targetFileSize, dbDir, allocator, opener, compressBlocks);
+            job, oldestLiveSeq, targetFileSize, dbDir, allocator, opener,
+            compressBlocks, writeHook);
         return workers.submit(task);
     }
 

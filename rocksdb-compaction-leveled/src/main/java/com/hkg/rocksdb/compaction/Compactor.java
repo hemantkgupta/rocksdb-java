@@ -8,6 +8,7 @@ import com.hkg.rocksdb.manifest.FileMetadata;
 import com.hkg.rocksdb.sstable.BlockBasedTableReader;
 import com.hkg.rocksdb.sstable.BlockBasedTableReader.SsTableEntry;
 import com.hkg.rocksdb.sstable.BlockBasedTableWriter;
+import com.hkg.rocksdb.sstable.WriteHook;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -82,6 +83,23 @@ public final class Compactor {
                                           FileNumberAllocator allocator,
                                           ReaderOpener opener,
                                           boolean compressBlocks) throws IOException {
+        return run(job, oldestLiveSeq, targetFileSize, dbDir, allocator, opener,
+            compressBlocks, WriteHook.NO_OP);
+    }
+
+    /**
+     * Run a compaction with an explicit {@link WriteHook} on every output
+     * block flush. CP 13 wires the engine's {@code TokenBucketRateLimiter}
+     * behind this hook so compaction I/O is paced at block granularity.
+     */
+    public static List<FileMetadata> run(CompactionJob job,
+                                          long oldestLiveSeq,
+                                          long targetFileSize,
+                                          Path dbDir,
+                                          FileNumberAllocator allocator,
+                                          ReaderOpener opener,
+                                          boolean compressBlocks,
+                                          WriteHook writeHook) throws IOException {
 
         int outputLevel = job.outputLevel();
         boolean isBottomLevel = (outputLevel == Constants.MAX_LEVEL_COUNT - 1);
@@ -142,7 +160,7 @@ public final class Compactor {
                     if (writer == null) {
                         currentNum = allocator.allocate();
                         currentPath = dbDir.resolve(currentNum.tableFileName());
-                        writer = BlockBasedTableWriter.open(currentPath, compressBlocks);
+                        writer = BlockBasedTableWriter.open(currentPath, compressBlocks, writeHook);
                         smallestInOutput = e.internalKey();
                     }
                     writer.add(e.internalKey(), e.value());
