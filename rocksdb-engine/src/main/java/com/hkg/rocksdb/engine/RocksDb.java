@@ -13,6 +13,7 @@ import com.hkg.rocksdb.common.SequenceNumber;
 import com.hkg.rocksdb.common.Slice;
 import com.hkg.rocksdb.common.Snapshot;
 import com.hkg.rocksdb.common.ValueType;
+import com.hkg.rocksdb.compaction.CompactionExecutor;
 import com.hkg.rocksdb.compaction.CompactionJob;
 import com.hkg.rocksdb.compaction.Compactor;
 import com.hkg.rocksdb.compaction.LeveledCompactionPicker;
@@ -33,12 +34,15 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -74,12 +78,15 @@ public final class RocksDb implements KvEngine {
     private final Object writeLock = new Object();
     private final boolean compressOutput;
     private final BlockCache blockCache;
+    private final CompactionExecutor compactionExecutor;
+    /** File numbers currently being read by a compaction worker; consulted by the picker to avoid overlap. */
+    private final Set<FileNumber> inFlightFiles = ConcurrentHashMap.newKeySet();
 
     private RocksDb(Path dbDir, VersionSet versions, SkipListMemTable mt,
                      LogWriter walWriter, FileNumber walNumber,
                      ConcurrentHashMap<FileNumber, BlockBasedTableReader> tables,
                      AtomicLong nextSequence, boolean compressOutput,
-                     BlockCache blockCache) {
+                     BlockCache blockCache, CompactionExecutor compactionExecutor) {
         this.dbDir = dbDir;
         this.versions = versions;
         this.activeMemTable = mt;
@@ -89,6 +96,7 @@ public final class RocksDb implements KvEngine {
         this.nextSequence = nextSequence;
         this.compressOutput = compressOutput;
         this.blockCache = blockCache;
+        this.compactionExecutor = compactionExecutor;
     }
 
     /**
@@ -99,19 +107,32 @@ public final class RocksDb implements KvEngine {
      * separately by {@link #recoverWal(Path)} — wired up in CP 9.
      */
     public static RocksDb open(Path dbDir) throws IOException {
-        return open(dbDir, true, new LruBlockCache(Constants.BLOCK_CACHE_DEFAULT_BYTES));
+        return open(dbDir, true, new LruBlockCache(Constants.BLOCK_CACHE_DEFAULT_BYTES), 1);
     }
 
     public static RocksDb open(Path dbDir, boolean compressOutput) throws IOException {
-        return open(dbDir, compressOutput, new LruBlockCache(Constants.BLOCK_CACHE_DEFAULT_BYTES));
+        return open(dbDir, compressOutput, new LruBlockCache(Constants.BLOCK_CACHE_DEFAULT_BYTES), 1);
+    }
+
+    public static RocksDb open(Path dbDir, boolean compressOutput, BlockCache blockCache)
+        throws IOException {
+        return open(dbDir, compressOutput, blockCache, 1);
     }
 
     /**
-     * Open the engine with an explicit {@link BlockCache}. Tests can pass a
-     * small cache to exercise eviction or a shared cache to verify cross-reader
-     * hit rates. The cache is per-engine; RocksDb has no cross-instance sharing.
+     * Open the engine with an explicit {@link BlockCache} and a fixed-size pool
+     * of compaction worker threads. With {@code compactionThreads = 1} the
+     * engine behaves like LevelDB 2011 (one job at a time); with
+     * {@code compactionThreads > 1} the
+     * {@link com.hkg.rocksdb.compaction.LeveledCompactionPicker#pickMultiple
+     * picker} chooses several non-overlapping jobs that workers execute in
+     * parallel.
+     *
+     * <p>The cache and the executor are per-engine; cross-instance sharing
+     * (RocksDB plan CPs 24-25) is out of scope here.
      */
-    public static RocksDb open(Path dbDir, boolean compressOutput, BlockCache blockCache)
+    public static RocksDb open(Path dbDir, boolean compressOutput, BlockCache blockCache,
+                                int compactionThreads)
         throws IOException {
         Files.createDirectories(dbDir);
         boolean freshDb = !Files.exists(dbDir.resolve("CURRENT"));
@@ -160,8 +181,9 @@ public final class RocksDb implements KvEngine {
             new VersionEdit.SetLastSequence(maxSeq)));
 
         AtomicLong seq = new AtomicLong(maxSeq + 1L);
+        CompactionExecutor executor = new CompactionExecutor(compactionThreads);
         RocksDb db = new RocksDb(dbDir, vs, recoveredMt, wal,
-            new FileNumber(walNum), tables, seq, compressOutput, blockCache);
+            new FileNumber(walNum), tables, seq, compressOutput, blockCache, executor);
 
         // If we recovered any in-memory state, persist it as an L0 SSTable so the old WAL
         // can be safely deleted. doFlush() opens a fresh WAL of its own and deletes the
@@ -436,27 +458,97 @@ public final class RocksDb implements KvEngine {
      * onto a background thread.
      */
     public boolean maybeCompact() throws IOException {
+        return runCompactionPass(1) > 0;
+    }
+
+    /**
+     * Run one compaction scheduling pass: pick up to {@code maxParallel}
+     * non-overlapping jobs, dispatch each to a worker on the
+     * {@link CompactionExecutor}, wait for them all to finish, and apply the
+     * resulting {@link VersionEdit}s (sequentially per job, under
+     * {@link #writeLock}). Returns the number of jobs that actually executed.
+     *
+     * <p>The writeLock is held only while picking, allocating file numbers,
+     * and applying edits — NOT while a worker is merging SSTables. This is
+     * the CP 10 win: foreground writes proceed concurrently with compaction
+     * work, and two non-overlapping compactions overlap in time.
+     *
+     * <p>If {@code maxParallel} exceeds the executor's worker count, the
+     * extra jobs queue inside the executor and execute as workers free up.
+     */
+    public int runCompactionPass(int maxParallel) throws IOException {
+        if (maxParallel < 1) {
+            throw new IllegalArgumentException("maxParallel must be >= 1, got " + maxParallel);
+        }
+        List<CompactionJob> jobs;
+        long oldestLive;
+        AtomicLong allocCounter;
         synchronized (writeLock) {
-            Optional<CompactionJob> picked = new LeveledCompactionPicker().pick(versions.current());
-            if (picked.isEmpty()) return false;
-            CompactionJob job = picked.get();
-            long oldestLive = oldestLiveSnapshotSequence();
-            // Allocator: bump nextFileNumber from VersionSet for each output.
-            long startNum = versions.current().nextFileNumber();
-            AtomicLong allocCounter = new AtomicLong(startNum);
-            List<FileMetadata> outputs = Compactor.run(job, oldestLive,
+            jobs = new LeveledCompactionPicker().pickMultiple(
+                versions.current(), new HashSet<>(inFlightFiles), maxParallel);
+            if (jobs.isEmpty()) return 0;
+            oldestLive = oldestLiveSnapshotSequence();
+            // One shared FileNumber allocator across all parallel jobs: every output gets
+            // a distinct number, and SetNextFileNumber after all jobs apply captures the high-water mark.
+            allocCounter = new AtomicLong(versions.current().nextFileNumber());
+            for (CompactionJob job : jobs) {
+                for (FileMetadata fm : job.allInputs()) {
+                    inFlightFiles.add(fm.fileNumber());
+                }
+            }
+        }
+
+        // Submit all jobs to the executor — they may run concurrently.
+        List<Future<List<FileMetadata>>> futures = new ArrayList<>(jobs.size());
+        Compactor.ReaderOpener opener = fn -> openTables.computeIfAbsent(fn, k -> {
+            try {
+                return BlockBasedTableReader.open(dbDir.resolve(k.tableFileName()), k, blockCache);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        });
+        for (CompactionJob job : jobs) {
+            futures.add(compactionExecutor.submit(job, oldestLive,
                 Constants.SST_FILE_TARGET_SIZE_BYTES, dbDir,
                 () -> new FileNumber(allocCounter.getAndIncrement()),
-                fn -> openTables.computeIfAbsent(fn, k -> {
-                    try {
-                        return BlockBasedTableReader.open(dbDir.resolve(k.tableFileName()), k, blockCache);
-                    } catch (IOException e) {
-                        throw new UncheckedIOException(e);
-                    }
-                }),
-                compressOutput);
+                opener,
+                compressOutput));
+        }
 
-            // Build VersionEdits: delete inputs + overlapping, add outputs, bump nextFileNumber.
+        // Wait for each job to finish, then apply its VersionEdits + cleanup.
+        int completed = 0;
+        try {
+            for (int i = 0; i < jobs.size(); i++) {
+                CompactionJob job = jobs.get(i);
+                List<FileMetadata> outputs;
+                try {
+                    outputs = futures.get(i).get();
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted waiting for compaction worker", ie);
+                } catch (ExecutionException ee) {
+                    Throwable cause = ee.getCause();
+                    if (cause instanceof IOException io) throw io;
+                    if (cause instanceof RuntimeException re) throw re;
+                    throw new IOException("compaction worker failed", cause);
+                }
+                applyCompactionResult(job, outputs, allocCounter);
+                completed++;
+            }
+        } finally {
+            for (CompactionJob job : jobs) {
+                for (FileMetadata fm : job.allInputs()) {
+                    inFlightFiles.remove(fm.fileNumber());
+                }
+            }
+        }
+        return completed;
+    }
+
+    /** Apply the VersionEdits for one finished compaction + clean up obsolete files. */
+    private void applyCompactionResult(CompactionJob job, List<FileMetadata> outputs,
+                                         AtomicLong allocCounter) throws IOException {
+        synchronized (writeLock) {
             List<VersionEdit> edits = new ArrayList<>();
             edits.add(new VersionEdit.SetNextFileNumber(allocCounter.get()));
             for (FileMetadata fm : job.inputs()) {
@@ -470,7 +562,6 @@ public final class RocksDb implements KvEngine {
             }
             versions.apply(edits);
 
-            // Open new SSTable readers; close + delete obsolete files.
             for (FileMetadata out : outputs) {
                 openTables.computeIfAbsent(out.fileNumber(), k -> {
                     try {
@@ -486,7 +577,6 @@ public final class RocksDb implements KvEngine {
             for (FileMetadata fm : job.overlapping()) {
                 closeAndDelete(fm.fileNumber());
             }
-            return true;
         }
     }
 
@@ -516,6 +606,11 @@ public final class RocksDb implements KvEngine {
         throw new UnsupportedOperationException("scan() lands in CP 10 (Phase 3)");
     }
 
+    /** Number of compaction worker threads this engine is using. */
+    public int compactionThreads() {
+        return compactionExecutor.threadCount();
+    }
+
     @Override
     public void close() {
         synchronized (writeLock) {
@@ -533,6 +628,7 @@ public final class RocksDb implements KvEngine {
                 throw new UncheckedIOException(e);
             }
         }
+        compactionExecutor.close();
     }
 
     /**
@@ -555,5 +651,6 @@ public final class RocksDb implements KvEngine {
                 throw new UncheckedIOException(e);
             }
         }
+        compactionExecutor.close();
     }
 }
