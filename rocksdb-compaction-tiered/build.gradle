@@ -1,0 +1,14 @@
+// rocksdb-compaction-tiered: size-tiered (universal / Cassandra-style) compaction picker.
+//
+// CP 11 of the RocksDB plan. The leveled picker lives in its own module
+// (rocksdb-compaction-leveled); tiered does not depend on it — it groups
+// SSTables by similar size and merges runs at the same size-tier, so the
+// inputLevel+outputLevel shape of {@code CompactionJob} does not fit and
+// this module defines its own {@code TieredCompactionJob} record.
+//
+// Engine integration (column-family-level style selection) lands in CP 14.
+
+dependencies {
+    api project(':rocksdb-common')
+    api project(':rocksdb-manifest')
+}
