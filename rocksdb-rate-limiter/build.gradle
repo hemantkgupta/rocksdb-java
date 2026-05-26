@@ -1,0 +1,5 @@
+// rocksdb-rate-limiter: per-host shared token-bucket rate limiter.
+//
+// CP 13 prep — pure JDK; no project dependencies. Engine integration (compaction
+// I/O + file-deletion throttling) lands in a later checkpoint when this limiter
+// is wired into rocksdb-engine.
