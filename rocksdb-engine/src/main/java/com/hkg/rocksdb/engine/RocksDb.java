@@ -12,6 +12,7 @@ import com.hkg.rocksdb.common.MutationRecord;
 import com.hkg.rocksdb.common.SequenceNumber;
 import com.hkg.rocksdb.common.Slice;
 import com.hkg.rocksdb.common.Snapshot;
+import com.hkg.rocksdb.common.UserTimestamp;
 import com.hkg.rocksdb.common.ValueType;
 import com.hkg.rocksdb.compaction.CompactionExecutor;
 import com.hkg.rocksdb.compaction.CompactionJob;
@@ -40,18 +41,26 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinTask;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * The assembled RocksDb engine. Composes a MemTable, a synchronous WAL, a
@@ -102,13 +111,26 @@ public final class RocksDb implements KvEngine {
     private final ReadOnlyModeLatch readOnlyLatch = new ReadOnlyModeLatch();
     /** CP 22 — maps thrown exceptions to severity buckets; HARDs trip the latch. */
     private final SeverityClassifier severityClassifier = new SeverityClassifier();
+    /**
+     * CP 27 — user-defined-timestamp size in bytes. {@code 0} disables UDT (LevelDB-era
+     * behaviour). When non-zero (currently only {@link com.hkg.rocksdb.common.UserTimestamp#ENCODED_LENGTH}
+     * = 8 is supported), {@link #putWithUserTs} / {@link #getAsOf} are available and the
+     * legacy {@link #put} path is rejected with {@code IllegalStateException}.
+     */
+    private final int userTimestampSize;
+    /**
+     * CP 27 — per-userKey set of timestamps written under UDT mode. Rebuilt at open
+     * time by iterating every SSTable; updated on put. {@code null} when UDT is off.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<Key, java.util.concurrent.ConcurrentSkipListSet<Long>> udtIndex;
 
     private RocksDb(Path dbDir, VersionSet versions, SkipListMemTable mt,
                      LogWriter walWriter, FileNumber walNumber,
                      ConcurrentHashMap<FileNumber, BlockBasedTableReader> tables,
                      AtomicLong nextSequence, boolean compressOutput,
                      BlockCache blockCache, CompactionExecutor compactionExecutor,
-                     RateLimiter rateLimiter, boolean kvChecksumEnabled) {
+                     RateLimiter rateLimiter, boolean kvChecksumEnabled,
+                     int userTimestampSize) {
         this.dbDir = dbDir;
         this.versions = versions;
         this.activeMemTable = mt;
@@ -121,6 +143,9 @@ public final class RocksDb implements KvEngine {
         this.compactionExecutor = compactionExecutor;
         this.rateLimiter = rateLimiter;
         this.kvChecksumEnabled = kvChecksumEnabled;
+        this.userTimestampSize = userTimestampSize;
+        this.udtIndex = userTimestampSize > 0
+            ? new java.util.concurrent.ConcurrentHashMap<>() : null;
     }
 
     /**
@@ -131,28 +156,36 @@ public final class RocksDb implements KvEngine {
      * separately by {@link #recoverWal(Path)} — wired up in CP 9.
      */
     public static RocksDb open(Path dbDir) throws IOException {
-        return open(dbDir, true, new LruBlockCache(Constants.BLOCK_CACHE_DEFAULT_BYTES), 1, null, false);
+        return open(dbDir, true, new LruBlockCache(Constants.BLOCK_CACHE_DEFAULT_BYTES), 1, null, false, 0);
     }
 
     public static RocksDb open(Path dbDir, boolean compressOutput) throws IOException {
-        return open(dbDir, compressOutput, new LruBlockCache(Constants.BLOCK_CACHE_DEFAULT_BYTES), 1, null, false);
+        return open(dbDir, compressOutput, new LruBlockCache(Constants.BLOCK_CACHE_DEFAULT_BYTES), 1, null, false, 0);
     }
 
     public static RocksDb open(Path dbDir, boolean compressOutput, BlockCache blockCache)
         throws IOException {
-        return open(dbDir, compressOutput, blockCache, 1, null, false);
+        return open(dbDir, compressOutput, blockCache, 1, null, false, 0);
     }
 
     public static RocksDb open(Path dbDir, boolean compressOutput, BlockCache blockCache,
                                 int compactionThreads)
         throws IOException {
-        return open(dbDir, compressOutput, blockCache, compactionThreads, null, false);
+        return open(dbDir, compressOutput, blockCache, compactionThreads, null, false, 0);
     }
 
     public static RocksDb open(Path dbDir, boolean compressOutput, BlockCache blockCache,
                                 int compactionThreads, RateLimiter rateLimiter)
         throws IOException {
-        return open(dbDir, compressOutput, blockCache, compactionThreads, rateLimiter, false);
+        return open(dbDir, compressOutput, blockCache, compactionThreads, rateLimiter, false, 0);
+    }
+
+    public static RocksDb open(Path dbDir, boolean compressOutput, BlockCache blockCache,
+                                int compactionThreads, RateLimiter rateLimiter,
+                                boolean kvChecksumEnabled)
+        throws IOException {
+        return open(dbDir, compressOutput, blockCache, compactionThreads, rateLimiter,
+            kvChecksumEnabled, 0);
     }
 
     /**
@@ -170,8 +203,12 @@ public final class RocksDb implements KvEngine {
      */
     public static RocksDb open(Path dbDir, boolean compressOutput, BlockCache blockCache,
                                 int compactionThreads, RateLimiter rateLimiter,
-                                boolean kvChecksumEnabled)
+                                boolean kvChecksumEnabled, int userTimestampSize)
         throws IOException {
+        if (userTimestampSize != 0 && userTimestampSize != UserTimestamp.ENCODED_LENGTH) {
+            throw new IllegalArgumentException(
+                "userTimestampSize must be 0 (off) or 8 (on), got " + userTimestampSize);
+        }
         Files.createDirectories(dbDir);
         boolean freshDb = !Files.exists(dbDir.resolve("CURRENT"));
         VersionSet vs = freshDb ? VersionSet.createFresh(dbDir) : VersionSet.open(dbDir);
@@ -224,7 +261,10 @@ public final class RocksDb implements KvEngine {
         CompactionExecutor executor = new CompactionExecutor(compactionThreads);
         RocksDb db = new RocksDb(dbDir, vs, recoveredMt, wal,
             new FileNumber(walNum), tables, seq, compressOutput, blockCache, executor,
-            rateLimiter, kvChecksumEnabled);
+            rateLimiter, kvChecksumEnabled, userTimestampSize);
+        if (userTimestampSize > 0) {
+            db.rebuildUdtIndex();
+        }
 
         // If we recovered any in-memory state, persist it as an L0 SSTable so the old WAL
         // can be safely deleted. doFlush() opens a fresh WAL of its own and deletes the
@@ -401,6 +441,297 @@ public final class RocksDb implements KvEngine {
         if (!kvChecksumEnabled) return wrapped;
         byte[] stripped = KvChecksumCodec.unwrap(key.bytes(), wrapped.toBytes());
         return Slice.of(stripped);
+    }
+
+    // -------------------------------------------------------------------- multiGet (CP 28)
+
+    /**
+     * CP 28 — batched point lookup. Resolves N keys at a single, consistent
+     * snapshot (the current sequence at call time) and returns a map keyed by
+     * the input Keys; absent keys map to {@link Optional#empty()}.
+     *
+     * <p>Execution (per ADR-0013): every input key is matched against the
+     * current {@link Version} to determine which SSTables it may hit (L0
+     * candidates via range overlap; L1..L_max via per-level binary search),
+     * then keys are <em>bucketed by SSTable</em>. Each non-empty bucket is
+     * dispatched to {@link ForkJoinPool#commonPool()} as one task that runs
+     * every bucketed key through that SSTable's {@code lookup}. After all
+     * tasks finish, results are merged per-key in the standard read-path
+     * priority order (active MemTable -&gt; frozen MemTable -&gt; L0 newest-first
+     * -&gt; L1 -&gt; ... -&gt; L_max). The MemTable + frozen MemTable probes run inline
+     * on the calling thread &mdash; no I/O to parallelise there.
+     *
+     * <p>If any sub-lookup throws, the FIRST exception observed is rethrown
+     * (after all in-flight tasks settle). {@link Severity#HARD_ERROR_READ_ONLY}
+     * exceptions trip the engine's read-only latch via {@link #tripIfHard}.
+     * The returned map BEFORE the throw carries results for every key whose
+     * candidate buckets all completed cleanly; this matches ADR-0013's
+     * "partial results plus first error" v1 contract. Implementation: the
+     * exception is thrown via a {@link MultiGetPartialResult} carrying the
+     * partial map alongside the cause; callers that want the partial view
+     * can catch and inspect.
+     *
+     * <p>If KV checksum is enabled, every returned value is unwrapped via
+     * {@link #unwrapKvChecksumIfNeeded} on the calling thread.
+     *
+     * <p>Duplicate keys in the input list collapse into the same map entry
+     * &mdash; the returned map's size is the count of <em>distinct</em> keys.
+     */
+    public Map<Key, Optional<Slice>> multiGet(List<Key> keys) {
+        Objects.requireNonNull(keys, "keys");
+        long current = nextSequence.get();
+        SequenceNumber asOf = current > 0 ? new SequenceNumber(current - 1) : SequenceNumber.ZERO;
+        return multiGetAt(keys, asOf);
+    }
+
+    /**
+     * CP 28 &mdash; snapshot-aware batched lookup. Every key is resolved at
+     * {@code snapshot.sequence()}; writes appended after the snapshot was
+     * taken are invisible.
+     */
+    public Map<Key, Optional<Slice>> multiGet(List<Key> keys, Snapshot snapshot) {
+        Objects.requireNonNull(keys, "keys");
+        Objects.requireNonNull(snapshot, "snapshot");
+        return multiGetAt(keys, snapshot.sequence());
+    }
+
+    /**
+     * Exception thrown by {@link #multiGet} when at least one bucket task
+     * failed. Carries the partial result map (keys whose lookups completed
+     * cleanly) alongside the underlying cause. The first observed sub-lookup
+     * failure is the wrapped cause; subsequent failures are dropped.
+     */
+    public static final class MultiGetPartialResult extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+        private final transient Map<Key, Optional<Slice>> partial;
+
+        public MultiGetPartialResult(Map<Key, Optional<Slice>> partial, Throwable cause) {
+            super("multiGet completed with partial results; first error: " + cause, cause);
+            this.partial = partial;
+        }
+
+        /** Snapshot of results for keys whose buckets all completed cleanly. */
+        public Map<Key, Optional<Slice>> partial() {
+            return partial;
+        }
+    }
+
+    private Map<Key, Optional<Slice>> multiGetAt(List<Key> keys, SequenceNumber asOf) {
+        Map<Key, Optional<Slice>> result = new LinkedHashMap<>();
+        if (keys.isEmpty()) return result;
+
+        // De-duplicate while preserving order: identical Keys collapse to one logical
+        // lookup; both input entries share the same returned value.
+        List<Key> unique = new ArrayList<>();
+        for (Key k : keys) {
+            if (!result.containsKey(k)) {
+                result.put(k, Optional.empty()); // placeholder; overwritten below
+                unique.add(k);
+            }
+        }
+
+        try {
+            BatchResolution res = resolveBatch(unique, asOf);
+            // Populate result for every key whose lookup completed (failed[i] == false).
+            for (int i = 0; i < unique.size(); i++) {
+                Key k = unique.get(i);
+                if (res.failed[i]) {
+                    // Leave Optional.empty() placeholder; the throw carries the partial map.
+                    continue;
+                }
+                KeyLookup r = res.resolved[i];
+                if (r instanceof KeyLookup.Found f) {
+                    result.put(k, Optional.of(unwrapKvChecksumIfNeeded(k, f.value())));
+                } else {
+                    result.put(k, Optional.empty());
+                }
+            }
+            if (res.firstError != null) {
+                // CP 22 — propagate HARD-severity exceptions to the read-only latch
+                // before throwing the partial-result wrapper.
+                tripIfHard(res.firstError);
+                throw new MultiGetPartialResult(result, res.firstError);
+            }
+            return result;
+        } catch (MultiGetPartialResult e) {
+            throw e;
+        } catch (RuntimeException e) {
+            tripIfHard(e);
+            throw e;
+        }
+    }
+
+    /** Aggregated outcome of one batch resolution. */
+    private static final class BatchResolution {
+        final KeyLookup[] resolved;
+        final boolean[] failed;
+        final Throwable firstError;
+        BatchResolution(KeyLookup[] r, boolean[] f, Throwable err) {
+            this.resolved = r; this.failed = f; this.firstError = err;
+        }
+    }
+
+    /**
+     * Bucket {@code uniqueKeys} by SSTable, dispatch per-bucket lookups to
+     * {@link ForkJoinPool#commonPool()}, and merge results in priority order.
+     *
+     * <p>Per-SSTable bucketing strategy (ADR-0013 §6.2 point 2): for each
+     * input key, walk the snapshotted Version's L0 (newest-first by file
+     * number) collecting every file whose [smallestKey, largestKey] range
+     * covers the key; then for L1..L_max use {@link #findInLevel} to pick
+     * the single covering file per level. Each covered file is added to a
+     * bucket keyed by FileNumber. One ForkJoin task per bucket runs every
+     * key in that bucket through the open reader's {@code lookup}, opening
+     * the file handle once and reusing the bloom filter / index probe for
+     * cache locality across the bucket.
+     */
+    private BatchResolution resolveBatch(List<Key> uniqueKeys, SequenceNumber asOf) {
+        int n = uniqueKeys.size();
+
+        // 1. Inline probe of active + frozen MemTables (no I/O to parallelise).
+        KeyLookup[] resolved = new KeyLookup[n];
+        boolean[] done = new boolean[n];
+        boolean[] failed = new boolean[n];
+        SkipListMemTable active = activeMemTable;
+        SkipListMemTable frozen = frozenMemTable;
+        for (int i = 0; i < n; i++) {
+            KeyLookup r = active.lookup(uniqueKeys.get(i), asOf);
+            if (!(r instanceof KeyLookup.Absent)) {
+                resolved[i] = r;
+                done[i] = true;
+                continue;
+            }
+            if (frozen != null) {
+                r = frozen.lookup(uniqueKeys.get(i), asOf);
+                if (!(r instanceof KeyLookup.Absent)) {
+                    resolved[i] = r;
+                    done[i] = true;
+                    continue;
+                }
+            }
+            resolved[i] = new KeyLookup.Absent();
+        }
+
+        // 2. Snapshot the current Version once for the whole batch.
+        Version v = versions.current();
+
+        // 3. Per-key candidate file list (priority order: L0 newest -> ... -> L_max).
+        List<FileMetadata> l0 = new ArrayList<>(v.level(0));
+        l0.sort(Comparator.comparingLong((FileMetadata fm) -> fm.fileNumber().value()).reversed());
+
+        @SuppressWarnings("unchecked")
+        List<FileNumber>[] candidates = (List<FileNumber>[]) new List[n];
+        LinkedHashMap<FileNumber, List<Integer>> bucket = new LinkedHashMap<>();
+
+        for (int i = 0; i < n; i++) {
+            if (done[i]) {
+                candidates[i] = List.of();
+                continue;
+            }
+            List<FileNumber> cand = new ArrayList<>();
+            Key k = uniqueKeys.get(i);
+            for (FileMetadata fm : l0) {
+                if (userKeyInRange(k, fm)) {
+                    cand.add(fm.fileNumber());
+                    bucket.computeIfAbsent(fm.fileNumber(), x -> new ArrayList<>()).add(i);
+                }
+            }
+            for (int level = 1; level < Constants.MAX_LEVEL_COUNT; level++) {
+                FileMetadata fm = findInLevel(v.level(level), k);
+                if (fm == null) continue;
+                cand.add(fm.fileNumber());
+                bucket.computeIfAbsent(fm.fileNumber(), x -> new ArrayList<>()).add(i);
+            }
+            candidates[i] = cand;
+        }
+
+        if (bucket.isEmpty()) {
+            return new BatchResolution(resolved, failed, null);
+        }
+
+        // 4. Dispatch one ForkJoin task per bucket.
+        ForkJoinPool pool = ForkJoinPool.commonPool();
+        AtomicReference<Throwable> firstError = new AtomicReference<>();
+        // Track which key indices a given file's task FAILED to produce a result for.
+        // (Empty map entry == every bucketed key for that file got a KeyLookup.)
+        Map<FileNumber, Map<Integer, KeyLookup>> perFile = new HashMap<>();
+        Map<FileNumber, Set<Integer>> perFileFailed = new HashMap<>();
+        List<ForkJoinTask<TaskResult>> tasks = new ArrayList<>(bucket.size());
+        List<FileNumber> orderedFiles = new ArrayList<>(bucket.keySet());
+
+        for (FileNumber fn : orderedFiles) {
+            List<Integer> idxs = bucket.get(fn);
+            BlockBasedTableReader reader = openTables.get(fn);
+            tasks.add(pool.submit(() -> {
+                Map<Integer, KeyLookup> out = new HashMap<>();
+                Set<Integer> taskFailed = new HashSet<>();
+                if (reader == null) {
+                    // File closed / reopened away from us — treat every bucketed key as Absent.
+                    return new TaskResult(out, taskFailed);
+                }
+                for (int idx : idxs) {
+                    try {
+                        KeyLookup r = reader.lookup(uniqueKeys.get(idx), asOf);
+                        out.put(idx, r);
+                    } catch (IOException e) {
+                        firstError.compareAndSet(null, new UncheckedIOException(e));
+                        taskFailed.add(idx);
+                    } catch (RuntimeException e) {
+                        firstError.compareAndSet(null, e);
+                        taskFailed.add(idx);
+                    }
+                }
+                return new TaskResult(out, taskFailed);
+            }));
+        }
+
+        // 5. Collect results (always wait for every task — even after observing a failure —
+        //    so we can correctly populate partial results).
+        for (int t = 0; t < tasks.size(); t++) {
+            FileNumber fn = orderedFiles.get(t);
+            try {
+                TaskResult tr = tasks.get(t).get();
+                perFile.put(fn, tr.results);
+                perFileFailed.put(fn, tr.failed);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                firstError.compareAndSet(null, new RuntimeException("interrupted during multiGet", ie));
+            } catch (ExecutionException ee) {
+                Throwable cause = ee.getCause() != null ? ee.getCause() : ee;
+                firstError.compareAndSet(null, cause);
+            }
+        }
+
+        // 6. Per-key, walk candidates in priority order to pick the winner.
+        for (int i = 0; i < n; i++) {
+            if (done[i]) continue;
+            boolean anyTaskFailedForThisKey = false;
+            for (FileNumber fn : candidates[i]) {
+                Set<Integer> tf = perFileFailed.get(fn);
+                if (tf != null && tf.contains(i)) {
+                    anyTaskFailedForThisKey = true;
+                    break; // can't trust subsequent priority levels — this key's value is unknown
+                }
+                Map<Integer, KeyLookup> m = perFile.get(fn);
+                if (m == null) continue;
+                KeyLookup r = m.get(i);
+                if (r == null) continue;
+                if (r instanceof KeyLookup.Found || r instanceof KeyLookup.Tombstoned) {
+                    resolved[i] = r;
+                    break;
+                }
+            }
+            if (anyTaskFailedForThisKey) failed[i] = true;
+        }
+
+        return new BatchResolution(resolved, failed, firstError.get());
+    }
+
+    /** Per-bucket task output: KeyLookup per resolved key + the set of keys that threw. */
+    private static final class TaskResult {
+        final Map<Integer, KeyLookup> results;
+        final Set<Integer> failed;
+        TaskResult(Map<Integer, KeyLookup> r, Set<Integer> f) { this.results = r; this.failed = f; }
     }
 
     private Optional<Slice> readAt(Key key, SequenceNumber asOf) {
@@ -881,6 +1212,123 @@ public final class RocksDb implements KvEngine {
      */
     public void attemptResume() {
         readOnlyLatch.attemptResume();
+    }
+
+    // -------------------------------------------------------------------- CP 27 — user-defined timestamps
+
+    /** True iff this engine was opened with {@code userTimestampSize > 0}. */
+    public boolean userTimestampsEnabled() {
+        return userTimestampSize > 0;
+    }
+
+    /**
+     * CP 27 — write a key/value at an application-supplied user timestamp.
+     * Only valid when {@link #userTimestampsEnabled()} is true. The user
+     * timestamp is appended (8 bytes BE) to the user key bytes at storage
+     * time, and tracked in a per-engine in-memory index that
+     * {@link #getAsOf} consults to find the floor ts.
+     */
+    public void putWithUserTs(Key key, UserTimestamp ts, Slice value) {
+        if (!userTimestampsEnabled()) {
+            throw new IllegalStateException("putWithUserTs requires userTimestampSize > 0");
+        }
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(ts, "ts");
+        Objects.requireNonNull(value, "value");
+        byte[] storedKeyBytes = appendTs(key.bytes(), ts.value());
+        put(Key.of(storedKeyBytes), value);
+        udtIndex.computeIfAbsent(key,
+            k -> new java.util.concurrent.ConcurrentSkipListSet<>()).add(ts.value());
+    }
+
+    /**
+     * CP 27 — point read at a user timestamp. Returns the value of the entry
+     * for {@code key} whose user timestamp is the largest value
+     * {@code ≤ asOfTs} (the "floor" timestamp), or {@link Optional#empty()}
+     * if no such entry exists.
+     *
+     * <p>Note the asymmetry with {@link #get(Key, Snapshot)}: snapshots are
+     * sequence-number-based and ordered by engine wall-clock; UDT visibility
+     * uses application-supplied timestamps and ignores sequence.
+     */
+    public Optional<Slice> getAsOf(Key key, UserTimestamp asOfTs) {
+        if (!userTimestampsEnabled()) {
+            throw new IllegalStateException("getAsOf requires userTimestampSize > 0");
+        }
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(asOfTs, "asOfTs");
+        java.util.concurrent.ConcurrentSkipListSet<Long> tss = udtIndex.get(key);
+        if (tss == null || tss.isEmpty()) return Optional.empty();
+        Long floor = tss.floor(asOfTs.value());
+        if (floor == null) return Optional.empty();
+        byte[] storedKeyBytes = appendTs(key.bytes(), floor);
+        return get(Key.of(storedKeyBytes));
+    }
+
+    /** Append an 8-byte BE-encoded ts to a user-key. */
+    private static byte[] appendTs(byte[] userKey, long ts) {
+        byte[] out = new byte[userKey.length + UserTimestamp.ENCODED_LENGTH];
+        System.arraycopy(userKey, 0, out, 0, userKey.length);
+        for (int i = 0; i < UserTimestamp.ENCODED_LENGTH; i++) {
+            out[userKey.length + i] = (byte) (ts >>> (56 - 8 * i));
+        }
+        return out;
+    }
+
+    /** Reverse of {@link #appendTs}: split a stored key into (userKey, ts). */
+    private static Object[] splitStoredKey(byte[] storedKey) {
+        if (storedKey.length < UserTimestamp.ENCODED_LENGTH) return null;
+        int userLen = storedKey.length - UserTimestamp.ENCODED_LENGTH;
+        byte[] userKey = new byte[userLen];
+        System.arraycopy(storedKey, 0, userKey, 0, userLen);
+        long ts = 0L;
+        for (int i = 0; i < UserTimestamp.ENCODED_LENGTH; i++) {
+            ts = (ts << 8) | (storedKey[userLen + i] & 0xFFL);
+        }
+        return new Object[] {userKey, ts};
+    }
+
+    /**
+     * CP 27 — at open time (or after recovery), walk every SSTable referenced
+     * by the current Version, split each entry's stored key into
+     * (userKey, ts), and populate {@link #udtIndex}. Also walks the active
+     * MemTable. This rebuilds the in-memory floor-lookup structure UDT reads
+     * depend on.
+     *
+     * <p>Memory cost: O(unique-user-keys × unique-timestamps). Acceptable for
+     * the pedagogical scope; production UDT persists a per-CF index sidecar
+     * to avoid the full scan on open.
+     */
+    private void rebuildUdtIndex() {
+        if (udtIndex == null) return;
+        // Walk every SSTable.
+        for (BlockBasedTableReader r : openTables.values()) {
+            try {
+                Iterator<BlockBasedTableReader.SsTableEntry> it = r.entries();
+                while (it.hasNext()) {
+                    BlockBasedTableReader.SsTableEntry e = it.next();
+                    Object[] split = splitStoredKey(e.internalKey().userKey().bytes());
+                    if (split == null) continue;
+                    byte[] uk = (byte[]) split[0];
+                    long ts = (Long) split[1];
+                    udtIndex.computeIfAbsent(Key.of(uk),
+                        k -> new java.util.concurrent.ConcurrentSkipListSet<>()).add(ts);
+                }
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
+        // Walk the active memtable (post-WAL-replay).
+        Iterator<SkipListMemTable.MemTableEntry> mit = activeMemTable.iterator();
+        while (mit.hasNext()) {
+            SkipListMemTable.MemTableEntry e = mit.next();
+            Object[] split = splitStoredKey(e.internalKey().userKey().bytes());
+            if (split == null) continue;
+            byte[] uk = (byte[]) split[0];
+            long ts = (Long) split[1];
+            udtIndex.computeIfAbsent(Key.of(uk),
+                k -> new java.util.concurrent.ConcurrentSkipListSet<>()).add(ts);
+        }
     }
 
     /**
