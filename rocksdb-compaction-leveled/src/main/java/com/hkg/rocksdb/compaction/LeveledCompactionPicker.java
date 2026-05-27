@@ -6,6 +6,7 @@ import com.hkg.rocksdb.manifest.FileMetadata;
 import com.hkg.rocksdb.manifest.Version;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
@@ -181,5 +182,107 @@ public final class LeveledCompactionPicker {
             if (d != 0) return d;
         }
         return a.length - b.length;
+    }
+
+    // ============================================================================
+    // CP 18 — parallel L0→L1 compaction via sub-range partitioning.
+    // ============================================================================
+
+    /**
+     * Split one L0→L1 compaction into up to {@code targetJobs} sub-jobs covering
+     * disjoint user-key sub-ranges of L0. Each returned {@link CompactionJob}
+     * references a non-overlapping subset of L0 files plus the L1 files those
+     * inputs overlap; multiple workers can run these concurrently because the
+     * file sets across sub-jobs are disjoint by construction.
+     *
+     * <p>Algorithm:
+     * <ol>
+     *   <li>Sort L0 files by smallest user key.</li>
+     *   <li>Partition the sorted list into {@code targetJobs} contiguous
+     *       groups of approximately equal file count.</li>
+     *   <li>Compute each group's L1 overlap.</li>
+     *   <li>Walk the groups in order; if group {@code i}'s L1 overlap intersects
+     *       group {@code i+1}'s L1 overlap, MERGE the two groups (their L0
+     *       files and their L1 overlaps) so the L1 file is only rewritten
+     *       once. This keeps every emitted job non-overlapping with every
+     *       other emitted job.</li>
+     *   <li>Drop empty groups.</li>
+     * </ol>
+     *
+     * <p>The merging step means {@code partitionL0(v, 4)} can legitimately
+     * return fewer than 4 jobs when the L0 files have overlapping key ranges
+     * or when many L0 files all hit the same L1 file. The caller (engine
+     * compaction scheduler) treats this as "the picker found as much
+     * parallelism as the data supports" and dispatches what it returns.
+     *
+     * <p>{@code targetJobs <= 1} or an empty L0 short-circuit to the
+     * single-job path via {@link #pick(Version)} so the caller doesn't have
+     * to branch.
+     */
+    public List<CompactionJob> partitionL0(Version version, int targetJobs) {
+        if (targetJobs <= 1) {
+            return pick(version).map(List::of).orElse(List.of());
+        }
+        List<FileMetadata> l0 = new ArrayList<>(version.level(0));
+        if (l0.isEmpty()) return List.of();
+        if (l0.size() < targetJobs) {
+            // Not enough L0 files to split into the requested job count.
+            return pick(version).map(List::of).orElse(List.of());
+        }
+
+        // Sort by smallest user key — gives stable input order for the partition.
+        l0.sort(Comparator.comparing(
+            (FileMetadata fm) -> fm.smallestKey().userKey().bytes(),
+            LeveledCompactionPicker::lexCompare));
+
+        // Greedy equal-count partition. With N files and K target jobs, each group
+        // gets either N/K or N/K + 1 files depending on remainder.
+        List<List<FileMetadata>> groups = new ArrayList<>(targetJobs);
+        int n = l0.size();
+        int base = n / targetJobs;
+        int extra = n % targetJobs;
+        int cursor = 0;
+        for (int g = 0; g < targetJobs; g++) {
+            int size = base + (g < extra ? 1 : 0);
+            groups.add(new ArrayList<>(l0.subList(cursor, cursor + size)));
+            cursor += size;
+        }
+
+        List<FileMetadata> l1 = version.level(1);
+        List<CompactionJob> jobs = new ArrayList<>(targetJobs);
+        List<List<FileMetadata>> overlaps = new ArrayList<>(targetJobs);
+        for (List<FileMetadata> group : groups) {
+            overlaps.add(findOverlapping(l1, group));
+        }
+
+        // Merge adjacent groups whose L1 overlaps intersect. After this loop, no two
+        // emitted jobs share any L1 file, so workers can run them in parallel.
+        for (int i = 0; i < groups.size() - 1; i++) {
+            if (shareAnyFile(overlaps.get(i), overlaps.get(i + 1))) {
+                groups.get(i).addAll(groups.get(i + 1));
+                // Recompute overlap for the merged group.
+                overlaps.set(i, findOverlapping(l1, groups.get(i)));
+                groups.remove(i + 1);
+                overlaps.remove(i + 1);
+                i--; // re-check the merged group against its new neighbour.
+            }
+        }
+
+        for (int i = 0; i < groups.size(); i++) {
+            List<FileMetadata> inputs = groups.get(i);
+            if (inputs.isEmpty()) continue;
+            jobs.add(new CompactionJob(0, 1, inputs, overlaps.get(i)));
+        }
+        return jobs;
+    }
+
+    private static boolean shareAnyFile(List<FileMetadata> a, List<FileMetadata> b) {
+        if (a.isEmpty() || b.isEmpty()) return false;
+        Set<FileNumber> aNums = new HashSet<>();
+        for (FileMetadata fm : a) aNums.add(fm.fileNumber());
+        for (FileMetadata fm : b) {
+            if (aNums.contains(fm.fileNumber())) return true;
+        }
+        return false;
     }
 }

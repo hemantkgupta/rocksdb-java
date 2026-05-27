@@ -478,6 +478,99 @@ public final class RocksDb implements KvEngine {
     }
 
     /**
+     * CP 18 — run a parallel L0→L1 compaction pass. The
+     * {@link LeveledCompactionPicker#partitionL0 picker} splits the L0 backlog
+     * into up to {@code targetJobs} disjoint sub-range jobs; the engine
+     * dispatches each to a worker. Returns the number of jobs that actually
+     * ran (may be {@literal <} {@code targetJobs} when L0 ranges or L1
+     * overlaps force merging).
+     *
+     * <p>Use this when the engine wants to maximise L0 drain throughput —
+     * e.g. when the L0 file count is near {@link Constants#L0_STOP_WRITES_TRIGGER}
+     * and the next-largest level can absorb writes in parallel. For ordinary
+     * scoring-based compaction (any level), call {@link #runCompactionPass}
+     * instead — it handles the general case.
+     */
+    public int runParallelL0Compaction(int targetJobs) throws IOException {
+        if (targetJobs < 1) {
+            throw new IllegalArgumentException("targetJobs must be >= 1, got " + targetJobs);
+        }
+        List<CompactionJob> jobs;
+        long oldestLive;
+        AtomicLong allocCounter;
+        synchronized (writeLock) {
+            jobs = new LeveledCompactionPicker().partitionL0(versions.current(), targetJobs);
+            if (jobs.isEmpty()) return 0;
+            // Filter out jobs that conflict with in-flight files (rare but possible if a regular
+            // compaction is already underway when this is called).
+            List<CompactionJob> kept = new ArrayList<>();
+            Set<FileNumber> banned = new HashSet<>(inFlightFiles);
+            for (CompactionJob j : jobs) {
+                boolean clean = true;
+                for (FileMetadata fm : j.allInputs()) {
+                    if (banned.contains(fm.fileNumber())) { clean = false; break; }
+                }
+                if (clean) {
+                    kept.add(j);
+                    for (FileMetadata fm : j.allInputs()) banned.add(fm.fileNumber());
+                }
+            }
+            jobs = kept;
+            if (jobs.isEmpty()) return 0;
+
+            oldestLive = oldestLiveSnapshotSequence();
+            allocCounter = new AtomicLong(versions.current().nextFileNumber());
+            for (CompactionJob job : jobs) {
+                for (FileMetadata fm : job.allInputs()) inFlightFiles.add(fm.fileNumber());
+            }
+        }
+
+        List<Future<List<FileMetadata>>> futures = new ArrayList<>(jobs.size());
+        Compactor.ReaderOpener opener = fn -> openTables.computeIfAbsent(fn, k -> {
+            try {
+                return BlockBasedTableReader.open(dbDir.resolve(k.tableFileName()), k, blockCache);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        });
+        WriteHook compactionHook = rateLimiterHookFor(Priority.LOW);
+        for (CompactionJob job : jobs) {
+            futures.add(compactionExecutor.submit(job, oldestLive,
+                Constants.SST_FILE_TARGET_SIZE_BYTES, dbDir,
+                () -> new FileNumber(allocCounter.getAndIncrement()),
+                opener,
+                compressOutput,
+                compactionHook));
+        }
+
+        int completed = 0;
+        try {
+            for (int i = 0; i < jobs.size(); i++) {
+                CompactionJob job = jobs.get(i);
+                List<FileMetadata> outputs;
+                try {
+                    outputs = futures.get(i).get();
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted waiting for compaction worker", ie);
+                } catch (ExecutionException ee) {
+                    Throwable cause = ee.getCause();
+                    if (cause instanceof IOException io) throw io;
+                    if (cause instanceof RuntimeException re) throw re;
+                    throw new IOException("compaction worker failed", cause);
+                }
+                applyCompactionResult(job, outputs, allocCounter);
+                completed++;
+            }
+        } finally {
+            for (CompactionJob job : jobs) {
+                for (FileMetadata fm : job.allInputs()) inFlightFiles.remove(fm.fileNumber());
+            }
+        }
+        return completed;
+    }
+
+    /**
      * Run one compaction scheduling pass: pick up to {@code maxParallel}
      * non-overlapping jobs, dispatch each to a worker on the
      * {@link CompactionExecutor}, wait for them all to finish, and apply the
