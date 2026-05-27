@@ -5,6 +5,7 @@ import com.hkg.rocksdb.common.Slice;
 import com.hkg.rocksdb.engine.RocksDb;
 import com.hkg.rocksdb.tools.DbDump;
 import com.hkg.rocksdb.tools.DbVerify;
+import com.hkg.rocksdb.tools.ManifestDump;
 
 import java.io.IOException;
 import java.io.PrintWriter;
@@ -23,6 +24,7 @@ import java.util.Optional;
  *   scan    &lt;dbDir&gt; [limit]            Stream every key from the engine.
  *   verify  &lt;dbDir&gt;                   Block-CRC walk; prints per-file PASS/FAIL.
  *   dump    &lt;dbDir&gt;                   Hex dump of every SSTable entry.
+ *   manifest-dump &lt;dbDir&gt;             Human-readable replay of every MANIFEST edit.
  *   compact &lt;dbDir&gt;                   Trigger one compaction pass and exit.
  * </pre>
  *
@@ -51,6 +53,7 @@ public final class RocksDbCli {
                 case "scan"    -> cmdScan(args);
                 case "verify"  -> cmdVerify(args);
                 case "dump"    -> cmdDump(args);
+                case "manifest-dump" -> cmdManifestDump(args);
                 case "compact" -> cmdCompact(args);
                 case "-h", "--help", "help" -> {
                     printHelp();
@@ -128,6 +131,12 @@ public final class RocksDbCli {
         return 0;
     }
 
+    private int cmdManifestDump(String[] args) throws IOException {
+        if (args.length != 2) return usage("manifest-dump <dbDir>");
+        ManifestDump.run(Path.of(args[1]), out);
+        return 0;
+    }
+
     private int cmdCompact(String[] args) throws IOException {
         if (args.length != 2) return usage("compact <dbDir>");
         Path dbDir = Path.of(args[1]);
@@ -152,6 +161,7 @@ public final class RocksDbCli {
         err.println("  scan    <dbDir> [limit]");
         err.println("  verify  <dbDir>");
         err.println("  dump    <dbDir>");
+        err.println("  manifest-dump <dbDir>");
         err.println("  compact <dbDir>");
     }
 

@@ -101,6 +101,29 @@ class RocksDbCliTest {
     }
 
     @Test
+    void manifestDumpEmitsTaggedEdits(@TempDir Path dir) {
+        // Write a couple of keys + compact so we get NewFile + SetLogNumber edits.
+        assertThat(new Cli().run("put", dir.toString(), "alpha", "ALPHA")).isZero();
+        assertThat(new Cli().run("put", dir.toString(), "beta", "BETA")).isZero();
+        assertThat(new Cli().run("compact", dir.toString())).isZero();
+
+        Cli md = new Cli();
+        assertThat(md.run("manifest-dump", dir.toString())).isZero();
+        assertThat(md.out()).contains("SetLogNumber");
+        assertThat(md.out()).contains("NewFile L0");
+    }
+
+    @Test
+    void manifestDumpMissingDirReturnsTwo(@TempDir Path dir) {
+        // No engine ever opened here → CURRENT missing → ManifestCorruptionException
+        // is bubbled out as a runtime error.
+        Cli md = new Cli();
+        int code = md.run("manifest-dump", dir.toString());
+        assertThat(code).isEqualTo(2);
+        assertThat(md.err()).contains("error:");
+    }
+
+    @Test
     void scanWithEmptyInitializedDbProducesNoOutput(@TempDir Path dir) {
         // Initialise the DB so CURRENT exists, but write nothing flushable.
         assertThat(new Cli().run("compact", dir.toString())).isZero();
