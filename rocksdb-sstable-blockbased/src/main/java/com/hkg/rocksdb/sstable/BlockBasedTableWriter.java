@@ -56,10 +56,35 @@ public final class BlockBasedTableWriter implements Closeable {
      */
     public static final String RANGE_TOMBSTONE_META_KEY = "rocksdb.range_tombstones";
 
+    /**
+     * CP 29 — presence of this meta-index entry signals that the SSTable's
+     * footer {@code indexHandle} points to a TOP-level index block whose
+     * entries are {@code (largestKey -> bottomLevelIndexBlockHandle)}.
+     * Absence (pre-CP-29 SSTables) means the footer {@code indexHandle}
+     * points to a single index block whose entries are
+     * {@code (largestKey -> dataBlockHandle)} — the original LevelDB layout.
+     * See ADR-0014.
+     */
+    public static final String TWO_LEVEL_INDEX_META_KEY = "rocksdb.index.two_level";
+
     private final FileChannel channel;
     private final boolean compressBlocks;
     private final WriteHook writeHook;
-    private final BlockBuilder indexBlock = new BlockBuilder();
+    /**
+     * CP 29 — file-size threshold at which the writer emits a two-level index.
+     * Defaults to {@link Constants#TWO_LEVEL_INDEX_THRESHOLD}; tests override
+     * with a tiny value so they don't have to write 32 MiB of data to exercise
+     * the two-level path.
+     */
+    private final long twoLevelIndexThreshold;
+    /**
+     * CP 29 — target size of a single bottom-level index block when two-level
+     * is in effect. Defaults to {@link Constants#INDEX_BLOCK_TARGET_BYTES}.
+     */
+    private final int indexBlockTargetBytes;
+    /** CP 29 — accumulated (largestKey, encodedHandle) pairs, one per data block. */
+    private final java.util.List<byte[]> indexKeys = new java.util.ArrayList<>();
+    private final java.util.List<byte[]> indexHandles = new java.util.ArrayList<>();
     private final BloomFilter.Builder bloomBuilder = new BloomFilter.Builder();
     private final CRC32 crc = new CRC32();
 
@@ -73,10 +98,13 @@ public final class BlockBasedTableWriter implements Closeable {
     private final java.util.List<com.hkg.rocksdb.common.RangeTombstone> rangeTombstones =
         new java.util.ArrayList<>();
 
-    private BlockBasedTableWriter(FileChannel channel, boolean compressBlocks, WriteHook writeHook) {
+    private BlockBasedTableWriter(FileChannel channel, boolean compressBlocks, WriteHook writeHook,
+                                   long twoLevelIndexThreshold, int indexBlockTargetBytes) {
         this.channel = channel;
         this.compressBlocks = compressBlocks;
         this.writeHook = writeHook == null ? WriteHook.NO_OP : writeHook;
+        this.twoLevelIndexThreshold = twoLevelIndexThreshold;
+        this.indexBlockTargetBytes = indexBlockTargetBytes;
     }
 
     /** Open a new SSTable file for writing. Truncates any existing file. */
@@ -96,11 +124,27 @@ public final class BlockBasedTableWriter implements Closeable {
      */
     public static BlockBasedTableWriter open(Path path, boolean compressBlocks, WriteHook hook)
         throws IOException {
+        return openWithIndexTuning(path, compressBlocks, hook,
+            Constants.TWO_LEVEL_INDEX_THRESHOLD, Constants.INDEX_BLOCK_TARGET_BYTES);
+    }
+
+    /**
+     * CP 29 — test-only opener that lets the caller override the two-level
+     * threshold and bottom-index block target size. Production callers use the
+     * normal {@link #open(Path, boolean, WriteHook)} overload, which hard-codes
+     * the {@link Constants} defaults.
+     */
+    public static BlockBasedTableWriter openWithIndexTuning(Path path, boolean compressBlocks,
+                                                             WriteHook hook,
+                                                             long twoLevelIndexThreshold,
+                                                             int indexBlockTargetBytes)
+        throws IOException {
         FileChannel ch = FileChannel.open(path,
             StandardOpenOption.CREATE,
             StandardOpenOption.WRITE,
             StandardOpenOption.TRUNCATE_EXISTING);
-        return new BlockBasedTableWriter(ch, compressBlocks, hook);
+        return new BlockBasedTableWriter(ch, compressBlocks, hook,
+            twoLevelIndexThreshold, indexBlockTargetBytes);
     }
 
     public void add(InternalKey key, byte[] value) throws IOException {
@@ -157,23 +201,102 @@ public final class BlockBasedTableWriter implements Closeable {
             rtHandle = writeBlock(RangeTombstoneBlock.encode(rangeTombstones), false);
         }
 
-        // Meta-index block: bloom always present; range-tombstones entry only when non-empty.
-        BlockBuilder metaIndex = new BlockBuilder();
-        metaIndex.add(BLOOM_META_KEY.getBytes(StandardCharsets.UTF_8), encodeHandle(bloomHandle));
+        // CP 29 — decide single-level vs. two-level index based on estimated final file size.
+        // Estimate = bytes already written (data + bloom + RT) + projected single-level index size.
+        long estimatedFinalSize = fileOffset + estimatedSingleLevelIndexBytes();
+        boolean twoLevel = estimatedFinalSize > twoLevelIndexThreshold
+            && indexKeys.size() > 1;
+
+        BlockHandle indexHandle;
+        if (twoLevel) {
+            indexHandle = writeTwoLevelIndex();
+        } else {
+            BlockBuilder indexBlock = new BlockBuilder();
+            for (int i = 0; i < indexKeys.size(); i++) {
+                indexBlock.add(indexKeys.get(i), indexHandles.get(i));
+            }
+            indexHandle = writeBlock(indexBlock.finish(), false);
+        }
+
+        // Meta-index block: bloom always present; range-tombstones + two-level marker conditional.
+        // Meta-index entries must be sorted by key — sort the marker keys deterministically.
+        java.util.List<byte[]> metaKeys = new java.util.ArrayList<>();
+        java.util.List<byte[]> metaValues = new java.util.ArrayList<>();
+        metaKeys.add(BLOOM_META_KEY.getBytes(StandardCharsets.UTF_8));
+        metaValues.add(encodeHandle(bloomHandle));
         if (rtHandle != null) {
-            metaIndex.add(RANGE_TOMBSTONE_META_KEY.getBytes(StandardCharsets.UTF_8),
-                encodeHandle(rtHandle));
+            metaKeys.add(RANGE_TOMBSTONE_META_KEY.getBytes(StandardCharsets.UTF_8));
+            metaValues.add(encodeHandle(rtHandle));
+        }
+        if (twoLevel) {
+            // The two-level marker's value is the top-level index handle (same as footer.indexHandle).
+            // Encoding it explicitly keeps the meta-index self-describing.
+            metaKeys.add(TWO_LEVEL_INDEX_META_KEY.getBytes(StandardCharsets.UTF_8));
+            metaValues.add(encodeHandle(indexHandle));
+        }
+        // Sort the parallel arrays by key (UTF-8 lexicographic), since BlockBuilder requires sorted input.
+        Integer[] order = new Integer[metaKeys.size()];
+        for (int i = 0; i < order.length; i++) order[i] = i;
+        java.util.Arrays.sort(order, (a, b) ->
+            java.util.Arrays.compareUnsigned(metaKeys.get(a), metaKeys.get(b)));
+        BlockBuilder metaIndex = new BlockBuilder();
+        for (int i : order) {
+            metaIndex.add(metaKeys.get(i), metaValues.get(i));
         }
         BlockHandle metaIndexHandle = writeBlock(metaIndex.finish(), false);
-
-        // Index block — one entry per data block, with the data block's last key.
-        BlockHandle indexHandle = writeBlock(indexBlock.finish(), false);
 
         Footer footer = new Footer(metaIndexHandle, indexHandle);
         writeFully(ByteBuffer.wrap(footer.encode()));
         channel.force(true);
         finished = true;
         return footer;
+    }
+
+    /** Approximate bytes a single-level index block would occupy on disk. */
+    private long estimatedSingleLevelIndexBytes() {
+        long bytes = 0L;
+        for (int i = 0; i < indexKeys.size(); i++) {
+            // 3 varints (header) + key + value bytes; varints are bounded above by 5 bytes apiece.
+            bytes += 15L + indexKeys.get(i).length + indexHandles.get(i).length;
+        }
+        // Restart array + trailer + compType + crc — rough overhead.
+        bytes += 64L;
+        return bytes;
+    }
+
+    /**
+     * CP 29 — partition the accumulated index entries into bottom-level index
+     * blocks (each ≤ INDEX_BLOCK_TARGET_BYTES), write each to the file, then
+     * build and write the top-level index block whose entries are
+     * {@code (largestKey-of-bottom -> bottomBlockHandle)}. Returns the handle
+     * of the top-level block (which becomes {@code footer.indexHandle}).
+     */
+    private BlockHandle writeTwoLevelIndex() throws IOException {
+        BlockBuilder topLevel = new BlockBuilder();
+
+        BlockBuilder bottom = new BlockBuilder();
+        byte[] lastKeyInBottom = null;
+        for (int i = 0; i < indexKeys.size(); i++) {
+            byte[] key = indexKeys.get(i);
+            byte[] handle = indexHandles.get(i);
+            // If adding this entry would exceed the target and the bottom block is non-empty,
+            // flush the current bottom block first.
+            int projected = bottom.estimatedSize() + 15 + key.length + handle.length;
+            if (!bottom.isEmpty() && projected > indexBlockTargetBytes) {
+                BlockHandle bh = writeBlock(bottom.finish(), false);
+                topLevel.add(lastKeyInBottom, encodeHandle(bh));
+                bottom = new BlockBuilder();
+                lastKeyInBottom = null;
+            }
+            bottom.add(key, handle);
+            lastKeyInBottom = key;
+        }
+        if (!bottom.isEmpty()) {
+            BlockHandle bh = writeBlock(bottom.finish(), false);
+            topLevel.add(lastKeyInBottom, encodeHandle(bh));
+        }
+
+        return writeBlock(topLevel.finish(), false);
     }
 
     public long entryCount() { return totalEntries; }
@@ -196,7 +319,8 @@ public final class BlockBasedTableWriter implements Closeable {
 
     private void flushPendingIndexEntry() {
         if (pendingIndexKey != null && pendingIndexHandle != null) {
-            indexBlock.add(pendingIndexKey, pendingIndexHandle);
+            indexKeys.add(pendingIndexKey);
+            indexHandles.add(pendingIndexHandle);
             pendingIndexKey = null;
             pendingIndexHandle = null;
         }

@@ -39,7 +39,16 @@ public final class BlockBasedTableReader implements Closeable {
     private final FileChannel channel;
     private final long fileSize;
     private final Footer footer;
+    /**
+     * CP 29 — when {@link #twoLevel} is false, this is the single index block
+     * (one entry per data block: {@code lastKey -> dataBlockHandle}).
+     * When {@link #twoLevel} is true, this is the small top-level index block
+     * (one entry per bottom-level index block:
+     * {@code lastKey-of-bottom -> bottomBlockHandle}) — pinned in memory.
+     * Bottom-level index blocks are loaded on demand via {@link #readBlock}.
+     */
     private final Block indexBlock;
+    private final boolean twoLevel;
     private final BloomFilter bloomFilter;
     private final FileNumber fileNumber;
     private final BlockCache cache;
@@ -49,7 +58,8 @@ public final class BlockBasedTableReader implements Closeable {
     private final List<RangeTombstone> rangeTombstones;
 
     private BlockBasedTableReader(FileChannel channel, long fileSize, Footer footer,
-                                   Block indexBlock, BloomFilter bloomFilter,
+                                   Block indexBlock, boolean twoLevel,
+                                   BloomFilter bloomFilter,
                                    FileNumber fileNumber, BlockCache cache,
                                    String dbId,
                                    List<RangeTombstone> rangeTombstones) {
@@ -57,6 +67,7 @@ public final class BlockBasedTableReader implements Closeable {
         this.fileSize = fileSize;
         this.footer = footer;
         this.indexBlock = indexBlock;
+        this.twoLevel = twoLevel;
         this.bloomFilter = bloomFilter;
         this.fileNumber = fileNumber;
         this.cache = cache;
@@ -103,18 +114,23 @@ public final class BlockBasedTableReader implements Closeable {
         // Bootstrap reader without the cache — the index/bloom blocks are loaded directly,
         // skipping the cache (they would just churn it on open and they're already in-memory).
         BlockBasedTableReader bootstrap = new BlockBasedTableReader(
-            ch, size, footer, null, null, fileNumber, null, null, List.of());
-
-        byte[] indexBytes = bootstrap.readBlockDirect(footer.indexHandle());
-        Block indexBlock = new Block(indexBytes);
+            ch, size, footer, null, false, null, fileNumber, null, null, List.of());
 
         byte[] metaIndexBytes = bootstrap.readBlockDirect(footer.metaIndexHandle());
         Block metaIndex = new Block(metaIndexBytes);
         BloomFilter bloom = loadBloomFilter(bootstrap, metaIndex);
         // CP 17 — range tombstones meta-block, absent in pre-CP-17 SSTables.
         List<RangeTombstone> rts = loadRangeTombstones(bootstrap, metaIndex);
+        // CP 29 — two-level marker; absent in pre-CP-29 SSTables (and in small two-level-eligible files).
+        boolean twoLevel = hasTwoLevelMarker(metaIndex);
 
-        return new BlockBasedTableReader(ch, size, footer, indexBlock, bloom, fileNumber, cache, dbId, rts);
+        // For both single-level and two-level layouts, the footer's indexHandle points to the block
+        // we want to pin in memory: the (sole) index block in single-level, the small top-level
+        // index block in two-level. Bottom-level index blocks are loaded on demand below.
+        byte[] indexBytes = bootstrap.readBlockDirect(footer.indexHandle());
+        Block indexBlock = new Block(indexBytes);
+
+        return new BlockBasedTableReader(ch, size, footer, indexBlock, twoLevel, bloom, fileNumber, cache, dbId, rts);
     }
 
     /**
@@ -129,13 +145,10 @@ public final class BlockBasedTableReader implements Closeable {
         InternalKey probe = new InternalKey(userKey, asOf, ValueType.VALUE);
         byte[] probeBytes = InternalKeyCodec.encode(probe);
 
-        int idx = indexBlock.seekIndex(probeBytes, InternalKeyCodec::compareInternalBytes);
-        if (idx < 0) {
+        BlockHandle dataHandle = resolveDataBlockHandle(probeBytes);
+        if (dataHandle == null) {
             return Optional.empty();
         }
-        Block.Entry indexEntry = indexBlock.get(idx);
-        BlockHandle dataHandle = BlockHandle.readFrom(
-            ByteBuffer.wrap(indexEntry.value()).order(ByteOrder.LITTLE_ENDIAN));
         byte[] dataBytes = readBlock(dataHandle);
         Block dataBlock = new Block(dataBytes);
 
@@ -179,11 +192,8 @@ public final class BlockBasedTableReader implements Closeable {
         InternalKey probe = new InternalKey(userKey, asOf, ValueType.VALUE);
         byte[] probeBytes = InternalKeyCodec.encode(probe);
 
-        int idx = indexBlock.seekIndex(probeBytes, InternalKeyCodec::compareInternalBytes);
-        if (idx < 0) return rtSeq >= 0 ? KeyLookup.TOMBSTONED : KeyLookup.ABSENT;
-        Block.Entry indexEntry = indexBlock.get(idx);
-        BlockHandle dataHandle = BlockHandle.readFrom(
-            ByteBuffer.wrap(indexEntry.value()).order(ByteOrder.LITTLE_ENDIAN));
+        BlockHandle dataHandle = resolveDataBlockHandle(probeBytes);
+        if (dataHandle == null) return rtSeq >= 0 ? KeyLookup.TOMBSTONED : KeyLookup.ABSENT;
         byte[] dataBytes = readBlock(dataHandle);
         Block dataBlock = new Block(dataBytes);
 
@@ -212,27 +222,44 @@ public final class BlockBasedTableReader implements Closeable {
      */
     public Iterator<SsTableEntry> entries() throws IOException {
         return new Iterator<>() {
-            int dataIdx = 0;
+            // CP 29 — in two-level mode this walks the top-level index, loading each bottom
+            // index block on demand; in single-level mode `bottomIndex` is just `indexBlock`.
+            int topIdx = 0;                        // position in indexBlock (top-level if twoLevel, else THE index)
+            Block currentBottomIndex = twoLevel ? null : indexBlock;
+            int bottomIdx = 0;                     // position within currentBottomIndex
             Block currentDataBlock = null;
-            int withinBlock = 0;
+            int withinDataBlock = 0;
             SsTableEntry next = pull();
 
             private SsTableEntry pull() {
                 try {
                     while (true) {
-                        if (currentDataBlock != null && withinBlock < currentDataBlock.size()) {
-                            Block.Entry e = currentDataBlock.get(withinBlock++);
+                        if (currentDataBlock != null && withinDataBlock < currentDataBlock.size()) {
+                            Block.Entry e = currentDataBlock.get(withinDataBlock++);
                             InternalKey ik = InternalKeyCodec.decode(e.key());
                             return new SsTableEntry(ik, e.value());
                         }
-                        if (dataIdx >= indexBlock.size()) {
-                            return null;
+                        // Need the next data-block handle.
+                        if (currentBottomIndex == null || bottomIdx >= currentBottomIndex.size()) {
+                            if (!twoLevel) {
+                                return null;
+                            }
+                            // Load the next bottom-level index block via the top-level.
+                            if (topIdx >= indexBlock.size()) {
+                                return null;
+                            }
+                            Block.Entry topEntry = indexBlock.get(topIdx++);
+                            BlockHandle bh = BlockHandle.readFrom(
+                                ByteBuffer.wrap(topEntry.value()).order(ByteOrder.LITTLE_ENDIAN));
+                            currentBottomIndex = new Block(readBlock(bh));
+                            bottomIdx = 0;
+                            continue;
                         }
-                        Block.Entry indexEntry = indexBlock.get(dataIdx++);
-                        BlockHandle h = BlockHandle.readFrom(
+                        Block.Entry indexEntry = currentBottomIndex.get(bottomIdx++);
+                        BlockHandle dh = BlockHandle.readFrom(
                             ByteBuffer.wrap(indexEntry.value()).order(ByteOrder.LITTLE_ENDIAN));
-                        currentDataBlock = new Block(readBlock(h));
-                        withinBlock = 0;
+                        currentDataBlock = new Block(readBlock(dh));
+                        withinDataBlock = 0;
                     }
                 } catch (IOException ex) {
                     throw new RuntimeException(ex);
@@ -249,10 +276,41 @@ public final class BlockBasedTableReader implements Closeable {
         };
     }
 
+    /**
+     * CP 29 — resolve an internal-key probe down to the handle of the data block
+     * that would contain it (single binary search in single-level mode; two
+     * binary searches with a bottom-index block load between them in two-level
+     * mode). Returns {@code null} if the probe lies past the last entry.
+     */
+    private BlockHandle resolveDataBlockHandle(byte[] probeBytes) throws IOException {
+        if (!twoLevel) {
+            int idx = indexBlock.seekIndex(probeBytes, InternalKeyCodec::compareInternalBytes);
+            if (idx < 0) return null;
+            Block.Entry e = indexBlock.get(idx);
+            return BlockHandle.readFrom(ByteBuffer.wrap(e.value()).order(ByteOrder.LITTLE_ENDIAN));
+        }
+        // Top-level binary search: find the bottom-index block whose largestKey >= probe.
+        int topIdx = indexBlock.seekIndex(probeBytes, InternalKeyCodec::compareInternalBytes);
+        if (topIdx < 0) return null;
+        Block.Entry topEntry = indexBlock.get(topIdx);
+        BlockHandle bottomHandle = BlockHandle.readFrom(
+            ByteBuffer.wrap(topEntry.value()).order(ByteOrder.LITTLE_ENDIAN));
+        // Bottom-index block loads via the block cache (if present) so repeated reads of the
+        // same key range stay in memory and aren't re-read from disk on every get().
+        byte[] bottomBytes = readBlock(bottomHandle);
+        Block bottomBlock = new Block(bottomBytes);
+        int botIdx = bottomBlock.seekIndex(probeBytes, InternalKeyCodec::compareInternalBytes);
+        if (botIdx < 0) return null;
+        Block.Entry botEntry = bottomBlock.get(botIdx);
+        return BlockHandle.readFrom(ByteBuffer.wrap(botEntry.value()).order(ByteOrder.LITTLE_ENDIAN));
+    }
+
     public Footer footer() { return footer; }
     public BloomFilter bloomFilter() { return bloomFilter; }
     public Block indexBlock() { return indexBlock; }
     public long fileSize() { return fileSize; }
+    /** CP 29 — true iff this SSTable uses the two-level index layout (ADR-0014). */
+    public boolean isTwoLevelIndex() { return twoLevel; }
 
     @Override
     public void close() throws IOException {
@@ -317,6 +375,17 @@ public final class BlockBasedTableReader implements Closeable {
             }
         }
         throw new SsTableFormatException("no bloom filter entry in meta-index block");
+    }
+
+    /** CP 29 — true iff the meta-index advertises a top-level index pointer. */
+    private static boolean hasTwoLevelMarker(Block metaIndex) {
+        for (Block.Entry e : metaIndex.entries()) {
+            String name = new String(e.key(), StandardCharsets.UTF_8);
+            if (BlockBasedTableWriter.TWO_LEVEL_INDEX_META_KEY.equals(name)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** CP 17 — load range tombstones if present; return empty list for older SSTables. */

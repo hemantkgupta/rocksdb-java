@@ -57,4 +57,20 @@ public final class Constants {
 
     /** L0 file count above which writes stop until compaction catches up. */
     public static final int L0_STOP_WRITES_TRIGGER = 12;
+
+    /**
+     * SSTable size at which the index is written as a two-level structure
+     * (ADR-0014, Phase 7 CP 29). Files at or below this threshold use a
+     * single index block; files above it emit multiple bottom-level index
+     * blocks plus a top-level index block, with only the top-level pinned
+     * in memory by the reader.
+     */
+    public static final long TWO_LEVEL_INDEX_THRESHOLD = 32L * 1024L * 1024L;
+
+    /**
+     * Target size of a single bottom-level index block in the two-level
+     * layout (4 KiB — same as a data block, so block-cache residency
+     * accounts for index blocks the same way it does data blocks).
+     */
+    public static final int INDEX_BLOCK_TARGET_BYTES = 4 * 1024;
 }
