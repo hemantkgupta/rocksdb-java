@@ -48,6 +48,17 @@ These are load-bearing across the whole codebase. Changing one of them is an ADR
 - **Four-layer integrity (block / file / handoff / KV checksums)** (ADR-0003). Compaction treats the KV checksum as opaque trailing bytes — **forwarded byte-for-byte, never re-derived**. A compactor that re-derives launders away in-memory corruption that occurred before the re-derivation. Tests enforce this invariant.
 - **Configuration is compile-time only.** All knobs live in `rocksdb-common/Constants.java` (Javadoc cites §12 of the plan). RocksDB famously has no runtime configurability for these defaults; changing them is a recompile.
 
+## Documentation map
+
+| Question | File |
+|---|---|
+| "What does the engine do?" | [`docs/spec/`](docs/spec/) — reference-grade spec, status-aware. Start at [`docs/spec/README.md`](docs/spec/README.md). |
+| "Why was this designed this way?" | [`docs/adr/`](docs/adr/) — 15 architecture decision records. |
+| "What depends on what?" | [`docs/architecture.md`](docs/architecture.md). |
+| "What's a one-page intro?" | [`README.md`](README.md). |
+
+The spec is **status-aware**: every section calls out where the current code diverges from the target ADR / plan claim. If a spec section and an ADR disagree, the spec describes today's behaviour and the ADR describes the destination.
+
 ## Read the ADRs before editing in these areas
 
 The `docs/adr/` directory carries the architectural reasoning. When a change touches one of these areas, read the corresponding ADR first — they document not just the decision but the rejected alternatives, so a "why don't we just..." instinct is usually already answered:
