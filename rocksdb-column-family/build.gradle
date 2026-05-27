@@ -1,0 +1,10 @@
+// rocksdb-column-family: per-CF identity + options + registry.
+//
+// CP 14 (Phase 3) of the RocksDB plan. This module ships the standalone types
+// (ColumnFamilyId, ColumnFamilyHandle, ColumnFamilyOptions, CompactionStyle,
+// ColumnFamilyRegistry). The engine wires them into per-CF MemTable + level
+// structure + shared-WAL routing in follow-on commits.
+
+dependencies {
+    api project(':rocksdb-common')
+}
