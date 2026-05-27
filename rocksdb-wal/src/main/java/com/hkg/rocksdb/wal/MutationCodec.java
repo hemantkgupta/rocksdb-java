@@ -15,12 +15,17 @@ import java.util.Objects;
  * <p>Hand-rolled binary framing (no Protobuf / JSON / Java serialization).
  * Layout (little-endian):
  * <pre>
- *   type:1   ; 1 = Put, 0 = Delete
+ *   type:1   ; 1 = Put, 0 = Delete, 4 = DeleteRange
  *   seq:8    ; sequence number
  *   keyLen:4
- *   key:keyLen
+ *   key:keyLen                ; for DeleteRange: this is the startKey
  *   [if Put] valLen:4 ; val:valLen
+ *   [if DeleteRange] endKeyLen:4 ; endKey:endKeyLen
  * </pre>
+ *
+ * <p>opType 4 (DeleteRange) is the CP 17 addition. Older WALs without it
+ * continue to replay unchanged because the type byte is the first thing the
+ * decoder reads; an unknown byte fails-fast with {@link WalCorruptionException}.
  */
 public final class MutationCodec {
 
@@ -48,6 +53,18 @@ public final class MutationCodec {
             buf.putLong(del.sequence().value());
             buf.putInt(keyLen);
             buf.put(del.key().slice().backing(), del.key().slice().offset(), keyLen);
+            return buf.array();
+        } else if (mutation instanceof MutationRecord.DeleteRange dr) {
+            int startLen = dr.startKey().length();
+            int endLen = dr.endKey().length();
+            ByteBuffer buf = ByteBuffer.allocate(1 + 8 + 4 + startLen + 4 + endLen)
+                .order(ByteOrder.LITTLE_ENDIAN);
+            buf.put((byte) 4);
+            buf.putLong(dr.sequence().value());
+            buf.putInt(startLen);
+            buf.put(dr.startKey().slice().backing(), dr.startKey().slice().offset(), startLen);
+            buf.putInt(endLen);
+            buf.put(dr.endKey().slice().backing(), dr.endKey().slice().offset(), endLen);
             return buf.array();
         }
         throw new IllegalStateException("unreachable: sealed MutationRecord");
@@ -83,6 +100,18 @@ public final class MutationCodec {
             return new MutationRecord.Put(key, Slice.of(valBytes), sequence);
         } else if (type == 0) {
             return new MutationRecord.Delete(key, sequence);
+        } else if (type == 4) {
+            // CP 17 — DeleteRange: the keyLen/key already decoded above is the startKey.
+            if (buf.remaining() < 4) {
+                throw new WalCorruptionException("DeleteRange payload missing endKey length");
+            }
+            int endKeyLen = buf.getInt();
+            if (endKeyLen < 0 || endKeyLen > buf.remaining()) {
+                throw new WalCorruptionException("invalid endKeyLen=" + endKeyLen);
+            }
+            byte[] endKeyBytes = new byte[endKeyLen];
+            buf.get(endKeyBytes);
+            return new MutationRecord.DeleteRange(key, Key.of(endKeyBytes), sequence);
         }
         throw new WalCorruptionException("unknown mutation type byte: " + type);
     }

@@ -4,15 +4,20 @@ import com.hkg.rocksdb.common.InternalKey;
 import com.hkg.rocksdb.common.Key;
 import com.hkg.rocksdb.common.KeyLookup;
 import com.hkg.rocksdb.common.MutationRecord;
+import com.hkg.rocksdb.common.RangeTombstone;
 import com.hkg.rocksdb.common.SequenceNumber;
 import com.hkg.rocksdb.common.Slice;
 import com.hkg.rocksdb.common.ValueType;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -36,6 +41,14 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class SkipListMemTable {
 
     private final ConcurrentSkipListMap<InternalKey, byte[]> entries = new ConcurrentSkipListMap<>();
+    /**
+     * CP 17 — range tombstones. Kept in insertion order; lookups linear-scan
+     * (the typical MemTable has tens to hundreds of RTs, never the millions
+     * of point entries). For RocksDB-grade hot-path performance an interval
+     * tree would replace this, but for the plan's pedagogical scope, the
+     * simple list is correct and clear.
+     */
+    private final CopyOnWriteArrayList<RangeTombstone> rangeTombstones = new CopyOnWriteArrayList<>();
     private final AtomicLong approximateBytes = new AtomicLong(0L);
     private final AtomicBoolean frozen = new AtomicBoolean(false);
 
@@ -67,6 +80,20 @@ public final class SkipListMemTable {
         if (prior == null) {
             approximateBytes.addAndGet(estimateBytes(key, 0));
         }
+    }
+
+    /**
+     * CP 17 — insert a range tombstone {@code [startKey, endKey)} valid as of
+     * {@code sequence}. Rejected if frozen.
+     */
+    public void deleteRange(Key startKey, Key endKey, SequenceNumber sequence) {
+        Objects.requireNonNull(startKey, "startKey");
+        Objects.requireNonNull(endKey, "endKey");
+        Objects.requireNonNull(sequence, "sequence");
+        ensureWritable();
+        RangeTombstone rt = new RangeTombstone(startKey, endKey, sequence);
+        rangeTombstones.add(rt);
+        approximateBytes.addAndGet((long) startKey.length() + endKey.length() + 9L + 32L);
     }
 
     /**
@@ -113,14 +140,72 @@ public final class SkipListMemTable {
     /**
      * Three-way lookup used by the engine's read path: distinguishes
      * Found / Tombstoned / Absent. The MemTable returns Tombstoned if the
-     * newest visible record is a deletion — the engine MUST stop probing
-     * older sources.
+     * newest visible record is a deletion (a point Delete or a covering
+     * RangeTombstone) — the engine MUST stop probing older sources.
+     *
+     * <p>CP 17 range-tombstone semantics: the MemTable computes
+     * {@code rtSeq} = max sequence of any {@link RangeTombstone} with
+     * {@code seq ≤ asOf} that covers {@code key}, then compares it with the
+     * point-lookup hit's sequence. Whichever is newer wins. If both are
+     * absent, returns Absent.
      */
     public KeyLookup lookup(Key key, SequenceNumber snapshotOrNull) {
-        Optional<MemTableLookup> hit = get(key, snapshotOrNull);
-        if (hit.isEmpty()) return KeyLookup.ABSENT;
-        if (hit.get().isDeletion()) return KeyLookup.TOMBSTONED;
-        return new KeyLookup.Found(hit.get().value());
+        long asOfValue = snapshotOrNull == null ? SequenceNumber.MAX : snapshotOrNull.value();
+        long rtSeq = maxCoveringRtSeqAtOrBefore(key, asOfValue);
+
+        // Probe for the newest point entry (Put or Delete) with seq ≤ asOf.
+        SequenceNumber probeSeq = snapshotOrNull != null
+            ? snapshotOrNull
+            : new SequenceNumber(SequenceNumber.MAX);
+        InternalKey probe = new InternalKey(key, probeSeq, ValueType.VALUE);
+        Map.Entry<InternalKey, byte[]> entry = entries.ceilingEntry(probe);
+
+        long pointSeq = -1L;
+        boolean pointIsDeletion = false;
+        Slice pointValue = null;
+        if (entry != null && entry.getKey().userKey().equals(key)) {
+            pointSeq = entry.getKey().sequence().value();
+            pointIsDeletion = entry.getKey().type() instanceof ValueType.Deletion;
+            if (!pointIsDeletion) {
+                pointValue = Slice.of(entry.getValue());
+            }
+        }
+
+        if (pointSeq < 0L && rtSeq < 0L) return KeyLookup.ABSENT;
+        if (rtSeq > pointSeq) {
+            // Range tombstone is newer than any point entry — TOMBSTONED.
+            return KeyLookup.TOMBSTONED;
+        }
+        // Point entry wins (or ties; either way the point's verdict is correct).
+        if (pointIsDeletion) return KeyLookup.TOMBSTONED;
+        return new KeyLookup.Found(pointValue);
+    }
+
+    /**
+     * Max sequence number of any {@link RangeTombstone} held by this MemTable
+     * whose {@code seq ≤ asOf} AND that covers {@code userKey}. Returns
+     * {@code -1L} if no such RT exists. Used by the engine's read path to
+     * decide whether a covering RT shadows a Put.
+     */
+    public long maxCoveringRtSeqAtOrBefore(Key userKey, long asOf) {
+        Objects.requireNonNull(userKey, "userKey");
+        long max = -1L;
+        for (RangeTombstone rt : rangeTombstones) {
+            long s = rt.sequence().value();
+            if (s > asOf) continue;
+            if (rt.covers(userKey) && s > max) max = s;
+        }
+        return max;
+    }
+
+    /** Snapshot of all range tombstones in insertion order. */
+    public List<RangeTombstone> rangeTombstones() {
+        return Collections.unmodifiableList(new ArrayList<>(rangeTombstones));
+    }
+
+    /** Number of range tombstones stored in this MemTable. */
+    public int rangeTombstoneCount() {
+        return rangeTombstones.size();
     }
 
     /** Approximate memtable memory footprint in bytes. */

@@ -40,6 +40,7 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
@@ -180,6 +181,8 @@ public final class RocksDb implements KvEngine {
                         recoveredMt.put(put.key(), put.value(), put.sequence());
                     } else if (mr instanceof MutationRecord.Delete del) {
                         recoveredMt.delete(del.key(), del.sequence());
+                    } else if (mr instanceof MutationRecord.DeleteRange dr) {
+                        recoveredMt.deleteRange(dr.startKey(), dr.endKey(), dr.sequence());
                     }
                     long s = mr.sequence().value();
                     if (s > maxSeq) maxSeq = s;
@@ -263,6 +266,35 @@ public final class RocksDb implements KvEngine {
                 MutationRecord.Delete del = new MutationRecord.Delete(key, new SequenceNumber(seq));
                 walWriter.append(MutationCodec.encode(del));
                 activeMemTable.delete(key, new SequenceNumber(seq));
+                maybeFlush();
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
+    }
+
+    /**
+     * CP 17 — DeleteRange API. Every user key in {@code [startKey, endKey)} is
+     * logically deleted as of the assigned sequence. End key is exclusive.
+     *
+     * <p>The range tombstone is appended to the WAL (durable before return) and
+     * added to the active MemTable. Subsequent flushes persist it as a meta-block
+     * in the resulting L0 SSTable; the read path consults RTs across MemTable +
+     * frozen MemTable + every SSTable and chooses the winner by sequence number.
+     */
+    public void deleteRange(Key startKey, Key endKey) {
+        Objects.requireNonNull(startKey, "startKey");
+        Objects.requireNonNull(endKey, "endKey");
+        if (startKey.compareTo(endKey) >= 0) {
+            throw new IllegalArgumentException("startKey must be strictly less than endKey");
+        }
+        synchronized (writeLock) {
+            try {
+                long seq = nextSequence.getAndIncrement();
+                MutationRecord.DeleteRange dr = new MutationRecord.DeleteRange(
+                    startKey, endKey, new SequenceNumber(seq));
+                walWriter.append(MutationCodec.encode(dr));
+                activeMemTable.deleteRange(startKey, endKey, new SequenceNumber(seq));
                 maybeFlush();
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
@@ -416,6 +448,12 @@ public final class RocksDb implements KvEngine {
 
     /** Freeze the active MemTable, write it as an L0 SSTable, record VersionEdit. */
     private void doFlush() throws IOException {
+        // No data AND no range tombstones to persist → nothing to do.
+        // CP 17 limitation: an RT-only MemTable (deleteRange calls but no put/delete)
+        // is NOT flushed here — the RT bounds would not yield a valid
+        // (smallestKey, largestKey) for FileMetadata. The RTs stay in MemTable until
+        // a subsequent point write triggers a normal flush; in the meantime they're
+        // durable in the WAL so a crash recovery replays them.
         if (activeMemTable.size() == 0) return;
 
         SkipListMemTable toFlush = activeMemTable;
@@ -443,6 +481,10 @@ public final class RocksDb implements KvEngine {
                 if (smallest == null) smallest = e.internalKey();
                 largest = e.internalKey();
                 w.add(e.internalKey(), e.value());
+            }
+            // CP 17 — persist range tombstones into the SSTable's meta-block.
+            for (com.hkg.rocksdb.common.RangeTombstone rt : toFlush.rangeTombstones()) {
+                w.addRangeTombstone(rt);
             }
             w.finish();
         }

@@ -49,6 +49,13 @@ public final class BlockBasedTableWriter implements Closeable {
      */
     public static final String BLOOM_META_KEY = "filter.leveldb.BuiltinBloomFilter2";
 
+    /**
+     * CP 17 — name of the range-tombstone entry inside the meta-index block.
+     * Older SSTables without DeleteRange writes have no such entry; readers
+     * fall back to an empty RT list (see {@link BlockBasedTableReader#rangeTombstones}).
+     */
+    public static final String RANGE_TOMBSTONE_META_KEY = "rocksdb.range_tombstones";
+
     private final FileChannel channel;
     private final boolean compressBlocks;
     private final WriteHook writeHook;
@@ -62,6 +69,9 @@ public final class BlockBasedTableWriter implements Closeable {
     private long fileOffset = 0L;
     private long totalEntries = 0;
     private boolean finished = false;
+    /** CP 17 — range tombstones accumulated before {@link #finish()}. */
+    private final java.util.List<com.hkg.rocksdb.common.RangeTombstone> rangeTombstones =
+        new java.util.ArrayList<>();
 
     private BlockBasedTableWriter(FileChannel channel, boolean compressBlocks, WriteHook writeHook) {
         this.channel = channel;
@@ -113,6 +123,19 @@ public final class BlockBasedTableWriter implements Closeable {
         }
     }
 
+    /**
+     * CP 17 — register a range tombstone that will be persisted as part of
+     * the SSTable's range-tombstone meta-block at {@link #finish()}. Multiple
+     * RTs may be added; order is preserved on disk.
+     */
+    public void addRangeTombstone(com.hkg.rocksdb.common.RangeTombstone rt) {
+        java.util.Objects.requireNonNull(rt, "rt");
+        if (finished) {
+            throw new IllegalStateException("writer already finished");
+        }
+        rangeTombstones.add(rt);
+    }
+
     public Footer finish() throws IOException {
         if (finished) {
             throw new IllegalStateException("writer already finished");
@@ -127,9 +150,20 @@ public final class BlockBasedTableWriter implements Closeable {
         BloomFilter bloom = bloomBuilder.build();
         BlockHandle bloomHandle = writeBlock(BloomBlock.encode(bloom), false);
 
-        // Meta-index block: one entry mapping the bloom filter name to its block handle.
+        // Optional range-tombstone meta-block (CP 17). Empty list → no block emitted;
+        // older readers and SSTables without DeleteRange writes look the same on disk.
+        BlockHandle rtHandle = null;
+        if (!rangeTombstones.isEmpty()) {
+            rtHandle = writeBlock(RangeTombstoneBlock.encode(rangeTombstones), false);
+        }
+
+        // Meta-index block: bloom always present; range-tombstones entry only when non-empty.
         BlockBuilder metaIndex = new BlockBuilder();
         metaIndex.add(BLOOM_META_KEY.getBytes(StandardCharsets.UTF_8), encodeHandle(bloomHandle));
+        if (rtHandle != null) {
+            metaIndex.add(RANGE_TOMBSTONE_META_KEY.getBytes(StandardCharsets.UTF_8),
+                encodeHandle(rtHandle));
+        }
         BlockHandle metaIndexHandle = writeBlock(metaIndex.finish(), false);
 
         // Index block — one entry per data block, with the data block's last key.

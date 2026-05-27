@@ -8,6 +8,7 @@ import com.hkg.rocksdb.common.InternalKey;
 import com.hkg.rocksdb.common.InternalKeyCodec;
 import com.hkg.rocksdb.common.Key;
 import com.hkg.rocksdb.common.KeyLookup;
+import com.hkg.rocksdb.common.RangeTombstone;
 import com.hkg.rocksdb.common.SequenceNumber;
 import com.hkg.rocksdb.common.Slice;
 import com.hkg.rocksdb.common.ValueType;
@@ -20,7 +21,9 @@ import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.Collections;
 import java.util.Iterator;
+import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Optional;
 import java.util.zip.CRC32;
@@ -40,10 +43,13 @@ public final class BlockBasedTableReader implements Closeable {
     private final BloomFilter bloomFilter;
     private final FileNumber fileNumber;
     private final BlockCache cache;
+    /** CP 17 — range tombstones loaded eagerly at open time; empty list for older SSTables. */
+    private final List<RangeTombstone> rangeTombstones;
 
     private BlockBasedTableReader(FileChannel channel, long fileSize, Footer footer,
                                    Block indexBlock, BloomFilter bloomFilter,
-                                   FileNumber fileNumber, BlockCache cache) {
+                                   FileNumber fileNumber, BlockCache cache,
+                                   List<RangeTombstone> rangeTombstones) {
         this.channel = channel;
         this.fileSize = fileSize;
         this.footer = footer;
@@ -51,6 +57,7 @@ public final class BlockBasedTableReader implements Closeable {
         this.bloomFilter = bloomFilter;
         this.fileNumber = fileNumber;
         this.cache = cache;
+        this.rangeTombstones = rangeTombstones;
     }
 
     /** Open and parse an SSTable file with no block cache (every data-block read hits disk). */
@@ -80,7 +87,7 @@ public final class BlockBasedTableReader implements Closeable {
         // Bootstrap reader without the cache — the index/bloom blocks are loaded directly,
         // skipping the cache (they would just churn it on open and they're already in-memory).
         BlockBasedTableReader bootstrap = new BlockBasedTableReader(
-            ch, size, footer, null, null, fileNumber, null);
+            ch, size, footer, null, null, fileNumber, null, List.of());
 
         byte[] indexBytes = bootstrap.readBlockDirect(footer.indexHandle());
         Block indexBlock = new Block(indexBytes);
@@ -88,8 +95,10 @@ public final class BlockBasedTableReader implements Closeable {
         byte[] metaIndexBytes = bootstrap.readBlockDirect(footer.metaIndexHandle());
         Block metaIndex = new Block(metaIndexBytes);
         BloomFilter bloom = loadBloomFilter(bootstrap, metaIndex);
+        // CP 17 — range tombstones meta-block, absent in pre-CP-17 SSTables.
+        List<RangeTombstone> rts = loadRangeTombstones(bootstrap, metaIndex);
 
-        return new BlockBasedTableReader(ch, size, footer, indexBlock, bloom, fileNumber, cache);
+        return new BlockBasedTableReader(ch, size, footer, indexBlock, bloom, fileNumber, cache, rts);
     }
 
     /**
@@ -139,16 +148,23 @@ public final class BlockBasedTableReader implements Closeable {
      * Three-way lookup used by the engine's read path: distinguishes
      * {@code Found(value)}, {@code Tombstoned} (the engine must NOT probe
      * older files), and {@code Absent} (the engine keeps looking).
+     *
+     * <p>CP 17 semantics: if a range tombstone in this SSTable covers
+     * {@code userKey} with a sequence strictly greater than any Put we
+     * find, the lookup returns TOMBSTONED. Within one SSTable, the most
+     * recent entry (point Put / point Delete / covering RT) wins.
      */
     public KeyLookup lookup(Key userKey, SequenceNumber asOf) throws IOException {
+        long rtSeq = maxCoveringRtSeqAtOrBefore(userKey, asOf.value());
         if (!bloomFilter.mightContain(userKey)) {
-            return KeyLookup.ABSENT;
+            // Bloom rejects the point lookup, but a covering RT can still TOMBSTONE.
+            return rtSeq >= 0 ? KeyLookup.TOMBSTONED : KeyLookup.ABSENT;
         }
         InternalKey probe = new InternalKey(userKey, asOf, ValueType.VALUE);
         byte[] probeBytes = InternalKeyCodec.encode(probe);
 
         int idx = indexBlock.seekIndex(probeBytes, InternalKeyCodec::compareInternalBytes);
-        if (idx < 0) return KeyLookup.ABSENT;
+        if (idx < 0) return rtSeq >= 0 ? KeyLookup.TOMBSTONED : KeyLookup.ABSENT;
         Block.Entry indexEntry = indexBlock.get(idx);
         BlockHandle dataHandle = BlockHandle.readFrom(
             ByteBuffer.wrap(indexEntry.value()).order(ByteOrder.LITTLE_ENDIAN));
@@ -156,11 +172,16 @@ public final class BlockBasedTableReader implements Closeable {
         Block dataBlock = new Block(dataBytes);
 
         int hitIdx = dataBlock.seekIndex(probeBytes, InternalKeyCodec::compareInternalBytes);
-        if (hitIdx < 0) return KeyLookup.ABSENT;
+        if (hitIdx < 0) return rtSeq >= 0 ? KeyLookup.TOMBSTONED : KeyLookup.ABSENT;
         Block.Entry hit = dataBlock.get(hitIdx);
         byte[] hitUserKey = InternalKeyCodec.userKeyOf(hit.key());
         if (!java.util.Arrays.equals(hitUserKey, userKey.bytes())) {
-            return KeyLookup.ABSENT;
+            return rtSeq >= 0 ? KeyLookup.TOMBSTONED : KeyLookup.ABSENT;
+        }
+        long hitSeq = InternalKeyCodec.sequenceOf(hit.key());
+        if (rtSeq > hitSeq) {
+            // Covering RT is newer than the point hit — TOMBSTONED.
+            return KeyLookup.TOMBSTONED;
         }
         byte tag = InternalKeyCodec.tagOf(hit.key());
         if (tag == ValueType.DELETION.tag()) {
@@ -280,6 +301,42 @@ public final class BlockBasedTableReader implements Closeable {
             }
         }
         throw new SsTableFormatException("no bloom filter entry in meta-index block");
+    }
+
+    /** CP 17 — load range tombstones if present; return empty list for older SSTables. */
+    private static List<RangeTombstone> loadRangeTombstones(BlockBasedTableReader reader, Block metaIndex)
+        throws IOException {
+        for (Block.Entry e : metaIndex.entries()) {
+            String name = new String(e.key(), StandardCharsets.UTF_8);
+            if (BlockBasedTableWriter.RANGE_TOMBSTONE_META_KEY.equals(name)) {
+                BlockHandle bh = BlockHandle.readFrom(
+                    ByteBuffer.wrap(e.value()).order(ByteOrder.LITTLE_ENDIAN));
+                byte[] rtBytes = reader.readBlock(bh);
+                return RangeTombstoneBlock.decode(rtBytes);
+            }
+        }
+        return List.of();
+    }
+
+    /** CP 17 — snapshot of all range tombstones in this SSTable. */
+    public List<RangeTombstone> rangeTombstones() {
+        return Collections.unmodifiableList(rangeTombstones);
+    }
+
+    /**
+     * CP 17 — max sequence of any {@link RangeTombstone} in this SSTable
+     * whose seq ≤ {@code asOf} AND that covers {@code userKey}. Returns
+     * {@code -1L} if no such RT exists. The engine's read path uses this
+     * to decide whether a covering RT shadows a Put.
+     */
+    public long maxCoveringRtSeqAtOrBefore(Key userKey, long asOf) {
+        long max = -1L;
+        for (RangeTombstone rt : rangeTombstones) {
+            long s = rt.sequence().value();
+            if (s > asOf) continue;
+            if (rt.covers(userKey) && s > max) max = s;
+        }
+        return max;
     }
 
     private static void readAt(FileChannel ch, long position, ByteBuffer dst) throws IOException {
