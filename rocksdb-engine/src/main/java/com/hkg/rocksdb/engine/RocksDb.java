@@ -17,6 +17,9 @@ import com.hkg.rocksdb.compaction.CompactionExecutor;
 import com.hkg.rocksdb.compaction.CompactionJob;
 import com.hkg.rocksdb.compaction.Compactor;
 import com.hkg.rocksdb.compaction.LeveledCompactionPicker;
+import com.hkg.rocksdb.errorhandling.ReadOnlyModeLatch;
+import com.hkg.rocksdb.errorhandling.Severity;
+import com.hkg.rocksdb.errorhandling.SeverityClassifier;
 import com.hkg.rocksdb.integrity.KvChecksumCodec;
 import com.hkg.rocksdb.ratelimiter.Priority;
 import com.hkg.rocksdb.ratelimiter.RateLimiter;
@@ -95,6 +98,10 @@ public final class RocksDb implements KvEngine {
      * poisoning) that disk-level integrity layers cannot.
      */
     private final boolean kvChecksumEnabled;
+    /** CP 22 — engine-wide read-only mode latch tripped on HARD-severity errors. */
+    private final ReadOnlyModeLatch readOnlyLatch = new ReadOnlyModeLatch();
+    /** CP 22 — maps thrown exceptions to severity buckets; HARDs trip the latch. */
+    private final SeverityClassifier severityClassifier = new SeverityClassifier();
 
     private RocksDb(Path dbDir, VersionSet versions, SkipListMemTable mt,
                      LogWriter walWriter, FileNumber walNumber,
@@ -174,7 +181,7 @@ public final class RocksDb implements KvEngine {
 
         ConcurrentHashMap<FileNumber, BlockBasedTableReader> tables = new ConcurrentHashMap<>();
         for (FileNumber fn : vs.current().allFileNumbers()) {
-            tables.put(fn, BlockBasedTableReader.open(dbDir.resolve(fn.tableFileName()), fn, blockCache));
+            tables.put(fn, BlockBasedTableReader.open(dbDir.resolve(fn.tableFileName()), fn, blockCache, dbDir.toString()));
         }
 
         // WAL replay: rebuild the MemTable from the prior WAL recorded in MANIFEST.
@@ -260,6 +267,7 @@ public final class RocksDb implements KvEngine {
 
     @Override
     public void put(Key key, Slice value) {
+        readOnlyLatch.ensureWritable();
         synchronized (writeLock) {
             try {
                 long seq = nextSequence.getAndIncrement();
@@ -273,13 +281,18 @@ public final class RocksDb implements KvEngine {
                 activeMemTable.put(key, storedValue, new SequenceNumber(seq));
                 maybeFlush();
             } catch (IOException e) {
+                tripIfHard(e);
                 throw new UncheckedIOException(e);
+            } catch (RuntimeException e) {
+                tripIfHard(e);
+                throw e;
             }
         }
     }
 
     @Override
     public void delete(Key key) {
+        readOnlyLatch.ensureWritable();
         synchronized (writeLock) {
             try {
                 long seq = nextSequence.getAndIncrement();
@@ -288,7 +301,11 @@ public final class RocksDb implements KvEngine {
                 activeMemTable.delete(key, new SequenceNumber(seq));
                 maybeFlush();
             } catch (IOException e) {
+                tripIfHard(e);
                 throw new UncheckedIOException(e);
+            } catch (RuntimeException e) {
+                tripIfHard(e);
+                throw e;
             }
         }
     }
@@ -308,6 +325,7 @@ public final class RocksDb implements KvEngine {
         if (startKey.compareTo(endKey) >= 0) {
             throw new IllegalArgumentException("startKey must be strictly less than endKey");
         }
+        readOnlyLatch.ensureWritable();
         synchronized (writeLock) {
             try {
                 long seq = nextSequence.getAndIncrement();
@@ -317,9 +335,28 @@ public final class RocksDb implements KvEngine {
                 activeMemTable.deleteRange(startKey, endKey, new SequenceNumber(seq));
                 maybeFlush();
             } catch (IOException e) {
+                tripIfHard(e);
                 throw new UncheckedIOException(e);
+            } catch (RuntimeException e) {
+                tripIfHard(e);
+                throw e;
             }
         }
+    }
+
+    /**
+     * CP 22 — classify a throwable and trip the read-only latch if the
+     * classifier returns {@link Severity#HARD_ERROR_READ_ONLY}. TRANSIENT
+     * leaves the latch untouched (the engine retries / surfaces); FATAL
+     * also leaves the latch untouched but the caller will propagate up.
+     * Returns the assigned severity for callers that want to act on it.
+     */
+    private Severity tripIfHard(Throwable t) {
+        Severity sev = severityClassifier.classify(t);
+        if (sev == Severity.HARD_ERROR_READ_ONLY) {
+            readOnlyLatch.trip(t.getClass().getSimpleName() + ": " + t.getMessage());
+        }
+        return sev;
     }
 
     // -------------------------------------------------------------------- reads
@@ -328,12 +365,29 @@ public final class RocksDb implements KvEngine {
     public Optional<Slice> get(Key key) {
         long current = nextSequence.get();
         SequenceNumber asOf = current > 0 ? new SequenceNumber(current - 1) : SequenceNumber.ZERO;
-        return readAt(key, asOf).map(v -> unwrapKvChecksumIfNeeded(key, v));
+        return getWithSeverity(key, asOf);
     }
 
     @Override
     public Optional<Slice> get(Key key, Snapshot snapshot) {
-        return readAt(key, snapshot.sequence()).map(v -> unwrapKvChecksumIfNeeded(key, v));
+        return getWithSeverity(key, snapshot.sequence());
+    }
+
+    /**
+     * Wraps the read path with CP 22 severity classification: any HARD-severity
+     * exception trips the read-only latch (in particular, KV-checksum
+     * mismatches and block-CRC mismatches). The exception still propagates;
+     * the latch ensures subsequent writes are rejected with
+     * {@code ReadOnlyModeException} until the operator calls
+     * {@link #attemptResume()}.
+     */
+    private Optional<Slice> getWithSeverity(Key key, SequenceNumber asOf) {
+        try {
+            return readAt(key, asOf).map(v -> unwrapKvChecksumIfNeeded(key, v));
+        } catch (RuntimeException e) {
+            tripIfHard(e);
+            throw e;
+        }
     }
 
     /**
@@ -541,7 +595,7 @@ public final class RocksDb implements KvEngine {
             new VersionEdit.NewFile(0, fm)));
 
         // Open the new SSTable for reads — wired into the shared block cache.
-        openTables.put(tableFn, BlockBasedTableReader.open(tablePath, tableFn, blockCache));
+        openTables.put(tableFn, BlockBasedTableReader.open(tablePath, tableFn, blockCache, dbDir.toString()));
 
         // Discard the frozen MemTable.
         frozenMemTable = null;
@@ -610,7 +664,7 @@ public final class RocksDb implements KvEngine {
         List<Future<List<FileMetadata>>> futures = new ArrayList<>(jobs.size());
         Compactor.ReaderOpener opener = fn -> openTables.computeIfAbsent(fn, k -> {
             try {
-                return BlockBasedTableReader.open(dbDir.resolve(k.tableFileName()), k, blockCache);
+                return BlockBasedTableReader.open(dbDir.resolve(k.tableFileName()), k, blockCache, dbDir.toString());
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
@@ -693,7 +747,7 @@ public final class RocksDb implements KvEngine {
         List<Future<List<FileMetadata>>> futures = new ArrayList<>(jobs.size());
         Compactor.ReaderOpener opener = fn -> openTables.computeIfAbsent(fn, k -> {
             try {
-                return BlockBasedTableReader.open(dbDir.resolve(k.tableFileName()), k, blockCache);
+                return BlockBasedTableReader.open(dbDir.resolve(k.tableFileName()), k, blockCache, dbDir.toString());
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
@@ -758,7 +812,7 @@ public final class RocksDb implements KvEngine {
             for (FileMetadata out : outputs) {
                 openTables.computeIfAbsent(out.fileNumber(), k -> {
                     try {
-                        return BlockBasedTableReader.open(dbDir.resolve(k.tableFileName()), k, blockCache);
+                        return BlockBasedTableReader.open(dbDir.resolve(k.tableFileName()), k, blockCache, dbDir.toString());
                     } catch (IOException e) {
                         throw new UncheckedIOException(e);
                     }
@@ -798,6 +852,35 @@ public final class RocksDb implements KvEngine {
     /** True iff this engine wraps stored values with a KV checksum (CP 21). */
     public boolean kvChecksumEnabled() {
         return kvChecksumEnabled;
+    }
+
+    /**
+     * CP 22 — true iff the engine has tripped its read-only latch in response
+     * to a HARD-severity error (block-CRC mismatch, KV-checksum mismatch,
+     * file-checksum mismatch). When tripped, writes throw
+     * {@code ReadOnlyModeException}; reads continue.
+     */
+    public boolean isReadOnly() {
+        return readOnlyLatch.isTripped();
+    }
+
+    /**
+     * CP 22 — last-known reason the read-only latch was tripped, or null
+     * if it hasn't been. Surface this to operators (logs, an admin
+     * endpoint) so they know what to investigate before calling
+     * {@link #attemptResume()}.
+     */
+    public String readOnlyReason() {
+        return readOnlyLatch.reason();
+    }
+
+    /**
+     * CP 22 — clear the read-only latch after the operator has investigated
+     * the cause of the HARD error. Writes resume; if the underlying issue
+     * remains, the next failing read or write will trip the latch again.
+     */
+    public void attemptResume() {
+        readOnlyLatch.attemptResume();
     }
 
     /**

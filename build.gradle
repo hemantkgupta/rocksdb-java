@@ -62,6 +62,7 @@ project(':rocksdb-engine') {
         api project(':rocksdb-block-cache')
         api project(':rocksdb-rate-limiter')
         api project(':rocksdb-integrity')
+        api project(':rocksdb-error-handling')
         api project(':rocksdb-column-family')
     }
 }
