@@ -9,29 +9,48 @@ import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.zip.CRC32;
 
 /**
  * Append-only writer for the RocksDb WAL format. Each {@link #append(byte[])}
- * writes one logical record, fragmented across blocks if necessary, and
- * (by default) calls {@code force(true)} for an fsync before returning.
+ * writes one logical record, fragmented across blocks if necessary. Durability
+ * behaviour is governed by the supplied {@link WalDurability}:
  *
- * <p>Not thread-safe; the engine serialises all WAL writes through a single
- * writer instance.
+ * <ul>
+ *   <li>{@link WalDurability.Sync} — fsync after every append, before the call returns.</li>
+ *   <li>{@link WalDurability.Buffered} — no fsync on the hot path; a daemon thread
+ *       fsyncs every {@code flushIntervalMillis}. {@link #close()} stops the thread and
+ *       does a final force(true).</li>
+ *   <li>{@link WalDurability.Disabled} — bytes are written to the channel but never
+ *       fsynced. {@link #close()} closes the channel without forcing.</li>
+ * </ul>
+ *
+ * <p>Not thread-safe with respect to concurrent {@code append} callers; the engine
+ * serialises all WAL writes through a single writer instance. The Buffered background
+ * flusher does call {@code channel.force(true)} concurrently with appends, which is
+ * safe on a {@link FileChannel} — {@code force} does not mutate writer position.
  */
 public final class LogWriter implements Closeable {
 
     private final FileChannel channel;
-    private final boolean syncOnAppend;
-    private int blockOffset;      // bytes written into the current block
-    private long bytesWritten;    // running total of bytes written via this writer
+    private final WalDurability durability;
+    private final BackgroundFlusher flusher; // null unless Buffered
+    private int blockOffset;                  // bytes written into the current block
+    private long bytesWritten;                // running total of bytes written via this writer
     private final CRC32 crc = new CRC32();
 
-    private LogWriter(FileChannel channel, boolean syncOnAppend, long initialPosition) {
+    private LogWriter(FileChannel channel, WalDurability durability, long initialPosition) {
         this.channel = channel;
-        this.syncOnAppend = syncOnAppend;
+        this.durability = durability;
         this.blockOffset = (int) (initialPosition % WalConstants.BLOCK_SIZE);
         this.bytesWritten = initialPosition;
+        if (durability instanceof WalDurability.Buffered buf) {
+            this.flusher = new BackgroundFlusher(channel, buf.flushIntervalMillis());
+            this.flusher.start();
+        } else {
+            this.flusher = null;
+        }
     }
 
     /**
@@ -39,23 +58,40 @@ public final class LogWriter implements Closeable {
      * @param syncOnAppend if true, fsync the file after every {@link #append}.
      */
     public static LogWriter open(Path file, boolean syncOnAppend) throws IOException {
+        return open(file, syncOnAppend ? WalDurability.sync() : WalDurability.disabled());
+    }
+
+    /** Open a fresh WAL file for writing under the given durability mode. */
+    public static LogWriter open(Path file, WalDurability durability) throws IOException {
+        Objects.requireNonNull(durability, "durability");
         OpenOption[] opts = new OpenOption[] {
             StandardOpenOption.CREATE,
             StandardOpenOption.WRITE,
             StandardOpenOption.TRUNCATE_EXISTING
         };
         FileChannel ch = FileChannel.open(file, opts);
-        return new LogWriter(ch, syncOnAppend, 0L);
+        return new LogWriter(ch, durability, 0L);
     }
 
     /** Open an existing WAL file in append mode, positioned at end-of-file. */
     public static LogWriter openForAppend(Path file, boolean syncOnAppend) throws IOException {
+        return openForAppend(file, syncOnAppend ? WalDurability.sync() : WalDurability.disabled());
+    }
+
+    /** Open an existing WAL file in append mode under the given durability mode. */
+    public static LogWriter openForAppend(Path file, WalDurability durability) throws IOException {
+        Objects.requireNonNull(durability, "durability");
         FileChannel ch = FileChannel.open(file,
             StandardOpenOption.CREATE,
             StandardOpenOption.WRITE,
             StandardOpenOption.APPEND);
         long pos = ch.size();
-        return new LogWriter(ch, syncOnAppend, pos);
+        return new LogWriter(ch, durability, pos);
+    }
+
+    /** The durability mode this writer was opened with. */
+    public WalDurability durability() {
+        return durability;
     }
 
     /**
@@ -73,11 +109,6 @@ public final class LogWriter implements Closeable {
             if (blockLeft < WalConstants.HEADER_SIZE) {
                 // Not enough room for even a header — zero-pad the rest of the block.
                 if (blockLeft > 0) {
-                    ByteBuffer pad = ByteBuffer.allocate(blockLeft);
-                    pad.flip();
-                    pad.limit(blockLeft);
-                    pad.position(0);
-                    // Write blockLeft zero bytes.
                     byte[] zeros = new byte[blockLeft];
                     writeFully(ByteBuffer.wrap(zeros));
                 }
@@ -105,27 +136,52 @@ public final class LogWriter implements Closeable {
             remaining -= fragmentLen;
         } while (remaining > 0);
 
-        if (syncOnAppend) {
+        if (durability instanceof WalDurability.Sync) {
             channel.force(true);
         }
+        // Buffered: background flusher will catch up.
+        // Disabled: never force.
     }
 
-    /** Force a fsync now (in case syncOnAppend was disabled). */
+    /** Force a fsync now (bypasses the configured mode). */
     public void sync() throws IOException {
         channel.force(true);
     }
 
-    /** Total bytes written through this writer (excluding zero padding bytes? no — including). */
+    /** Total bytes written through this writer (including any zero padding). */
     public long bytesWritten() {
         return bytesWritten;
     }
 
+    /**
+     * For Buffered mode: number of background fsyncs performed so far. Returns 0 for
+     * other modes. Exposed for tests.
+     */
+    public long backgroundForceCount() {
+        return flusher == null ? 0L : flusher.forceCount.get();
+    }
+
     @Override
     public void close() throws IOException {
+        IOException flusherErr = null;
+        if (flusher != null) {
+            try {
+                flusher.shutdown();
+            } catch (IOException e) {
+                flusherErr = e;
+            }
+        }
         try {
-            channel.force(true);
+            // Disabled: do not force on close — honour the contract that the embedder
+            // owns durability. Sync / Buffered: drain to disk before closing.
+            if (!(durability instanceof WalDurability.Disabled)) {
+                channel.force(true);
+            }
         } finally {
             channel.close();
+        }
+        if (flusherErr != null) {
+            throw flusherErr;
         }
     }
 
@@ -157,6 +213,61 @@ public final class LogWriter implements Closeable {
                 throw new IOException("channel reported EOF on write");
             }
             bytesWritten += written;
+        }
+    }
+
+    /**
+     * Daemon thread that fsyncs the WAL channel periodically for Buffered mode. The
+     * thread is a daemon so it never blocks JVM shutdown; {@link #shutdown()} is the
+     * orderly stop. Any IOException from a periodic force is swallowed and surfaced on
+     * shutdown (the close path also does a final force which will re-raise).
+     */
+    private static final class BackgroundFlusher extends Thread {
+        private final FileChannel channel;
+        private final long intervalMillis;
+        private volatile boolean running = true;
+        private volatile IOException lastError; // most recent force failure, if any
+        final AtomicLong forceCount = new AtomicLong();
+
+        BackgroundFlusher(FileChannel channel, long intervalMillis) {
+            super("rocksdb-wal-flusher");
+            this.channel = channel;
+            this.intervalMillis = intervalMillis;
+            setDaemon(true);
+        }
+
+        @Override
+        public void run() {
+            while (running) {
+                try {
+                    Thread.sleep(intervalMillis);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                if (!running) {
+                    return;
+                }
+                try {
+                    channel.force(true);
+                    forceCount.incrementAndGet();
+                } catch (IOException e) {
+                    lastError = e;
+                }
+            }
+        }
+
+        void shutdown() throws IOException {
+            running = false;
+            this.interrupt();
+            try {
+                this.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            if (lastError != null) {
+                throw lastError;
+            }
         }
     }
 }
