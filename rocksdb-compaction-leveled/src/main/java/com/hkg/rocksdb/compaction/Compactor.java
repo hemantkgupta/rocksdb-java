@@ -169,8 +169,14 @@ public final class Compactor {
                     if (writer.fileSize() >= targetFileSize) {
                         writer.finish();
                         writer.close();
+                        // CP 19 — file-level XXH64 over every byte of the output
+                        // SSTable. Stored in FileMetadata + MANIFEST; verified by
+                        // db-verify. Catches whole-file corruption that block
+                        // CRC cannot see.
+                        com.hkg.rocksdb.integrity.FileChecksum ck =
+                            com.hkg.rocksdb.integrity.FileChecksum.compute(currentPath);
                         outputs.add(new FileMetadata(currentNum, Files.size(currentPath),
-                            smallestInOutput, largestInOutput));
+                            smallestInOutput, largestInOutput, ck));
                         writer = null;
                         smallestInOutput = null;
                         largestInOutput = null;
@@ -181,8 +187,10 @@ public final class Compactor {
             if (writer != null) {
                 writer.finish();
                 writer.close();
+                com.hkg.rocksdb.integrity.FileChecksum ck =
+                    com.hkg.rocksdb.integrity.FileChecksum.compute(currentPath);
                 outputs.add(new FileMetadata(currentNum, Files.size(currentPath),
-                    smallestInOutput, largestInOutput));
+                    smallestInOutput, largestInOutput, ck));
             }
 
             return outputs;

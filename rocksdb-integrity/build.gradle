@@ -1,0 +1,11 @@
+// rocksdb-integrity: four-layer integrity primitives (block / file / handoff / KV checksums).
+//
+// FAST 2021 §5 + ADR 0003. Each layer catches a different threat class:
+//   - block CRC32  — lives in rocksdb-sstable-blockbased (CP 3, formalised CP 19)
+//   - file XXH64   — CP 19, lives here, stored in FileMetadata + MANIFEST
+//   - handoff CRC  — CP 20, lives here, threaded through fs.write
+//   - KV CRC32     — CP 21, lives here, wrapping (seq, key, value) at engine put/get
+
+dependencies {
+    api project(':rocksdb-common')
+}

@@ -3,6 +3,7 @@ package com.hkg.rocksdb.manifest;
 import com.hkg.rocksdb.common.FileNumber;
 import com.hkg.rocksdb.common.InternalKey;
 import com.hkg.rocksdb.common.InternalKeyCodec;
+import com.hkg.rocksdb.integrity.FileChecksum;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
@@ -20,12 +21,28 @@ import java.util.List;
  *     tag:1
  *     fields per tag:
  *       0x10 NEW_FILE         : varint(level), varint(fileNum), varint(sizeBytes),
- *                               varint(smallestLen), smallest, varint(largestLen), largest
+ *                               varint(smallestLen), smallest, varint(largestLen), largest,
+ *                               [hasChecksum:1, if 1 then checksum:8]   // CP 19 suffix
  *       0x11 DELETE_FILE      : varint(level), varint(fileNum)
  *       0x12 SET_LOG_NUMBER   : varlong
  *       0x13 SET_NEXT_FILENUM : varlong
  *       0x14 SET_LAST_SEQ     : varlong
  * </pre>
+ *
+ * <p><b>CP 19 — backward compat.</b> The {@code NEW_FILE} payload gained a
+ * trailing {@code (hasChecksum,checksum)} suffix in CP 19. Older MANIFEST
+ * records do not contain this suffix; the decoder distinguishes the two
+ * cases by peeking the next byte after {@code largest}:
+ * <ul>
+ *   <li>Byte value 0 or 1 → CP-19 flag (read suffix).</li>
+ *   <li>Byte value 0x10..0x14 → next edit's tag (older NewFile,
+ *       no checksum).</li>
+ *   <li>No remaining bytes → end of record (older NewFile, last edit).</li>
+ * </ul>
+ * This works because all defined edit tags are &ge; 0x10, so 0x00/0x01
+ * cannot collide. A v1 reader (pre-CP-19) reading a CP-19 record would
+ * fail at the spurious "tag 0x00/0x01" — acceptable since v1 is the
+ * predecessor format and rocksdb-java has not been deployed yet.
  *
  * <p>An unknown tag in the middle of a record is a hard error — matching
  * RocksDb's "no skip-unknown" semantics.
@@ -53,6 +70,17 @@ public final class VersionEditCodec {
                 writeVarLong(scratch, lg.length);
                 writeBuf(out, scratch);
                 writeBytes(out, lg);
+                // CP 19 suffix — always emit the flag so the decoder can
+                // unambiguously detect presence (see class javadoc).
+                FileChecksum fc = nf.metadata().fileChecksum();
+                scratch.clear();
+                if (fc == null) {
+                    scratch.put((byte) 0);
+                } else {
+                    scratch.put((byte) 1);
+                    scratch.putLong(fc.value());
+                }
+                writeBuf(out, scratch);
             } else if (edit instanceof VersionEdit.DeleteFile df) {
                 writeVarLong(scratch, df.level());
                 writeVarLong(scratch, df.fileNumber().value());
@@ -91,8 +119,9 @@ public final class VersionEditCodec {
                     buf.get(lg);
                     InternalKey smallest = InternalKeyCodec.decode(sm);
                     InternalKey largest = InternalKeyCodec.decode(lg);
+                    FileChecksum fc = maybeReadChecksumSuffix(buf);
                     edits.add(new VersionEdit.NewFile(level,
-                        new FileMetadata(new FileNumber(fileNum), sizeBytes, smallest, largest)));
+                        new FileMetadata(new FileNumber(fileNum), sizeBytes, smallest, largest, fc)));
                 }
                 case 0x11 -> {
                     int level = (int) readVarLong(buf);
@@ -107,6 +136,26 @@ public final class VersionEditCodec {
             }
         }
         return edits;
+    }
+
+    /**
+     * Peek the next byte after {@code largest}. If it's a CP-19 flag
+     * (0x00 or 0x01), consume the suffix and return the checksum (or
+     * null when the flag is 0). Otherwise leave the buffer untouched —
+     * it's either the next edit's tag (an older NewFile with no checksum)
+     * or end-of-record.
+     */
+    private static FileChecksum maybeReadChecksumSuffix(ByteBuffer buf) {
+        if (!buf.hasRemaining()) return null;
+        byte peek = buf.get(buf.position());
+        if (peek != 0 && peek != 1) {
+            // Looks like the next edit's tag — older format, no suffix.
+            return null;
+        }
+        buf.get(); // consume the flag
+        if (peek == 0) return null;
+        long value = buf.getLong();
+        return new FileChecksum(value);
     }
 
     private static void writeBuf(ByteArrayOutputStream out, ByteBuffer scratch) {

@@ -17,6 +17,7 @@ import com.hkg.rocksdb.compaction.CompactionExecutor;
 import com.hkg.rocksdb.compaction.CompactionJob;
 import com.hkg.rocksdb.compaction.Compactor;
 import com.hkg.rocksdb.compaction.LeveledCompactionPicker;
+import com.hkg.rocksdb.integrity.KvChecksumCodec;
 import com.hkg.rocksdb.ratelimiter.Priority;
 import com.hkg.rocksdb.ratelimiter.RateLimiter;
 import com.hkg.rocksdb.sstable.WriteHook;
@@ -87,13 +88,20 @@ public final class RocksDb implements KvEngine {
     private final Set<FileNumber> inFlightFiles = ConcurrentHashMap.newKeySet();
     /** Optional shared rate limiter. When non-null, compaction I/O is paced at block granularity. */
     private final RateLimiter rateLimiter;
+    /**
+     * CP 21 — when true, every value stored is wrapped with a 4-byte KV
+     * CRC32 over (seq, userKey, value) at put time and verified + stripped
+     * at get time. Catches above-block-CRC corruptions (RAM bit rot, cache
+     * poisoning) that disk-level integrity layers cannot.
+     */
+    private final boolean kvChecksumEnabled;
 
     private RocksDb(Path dbDir, VersionSet versions, SkipListMemTable mt,
                      LogWriter walWriter, FileNumber walNumber,
                      ConcurrentHashMap<FileNumber, BlockBasedTableReader> tables,
                      AtomicLong nextSequence, boolean compressOutput,
                      BlockCache blockCache, CompactionExecutor compactionExecutor,
-                     RateLimiter rateLimiter) {
+                     RateLimiter rateLimiter, boolean kvChecksumEnabled) {
         this.dbDir = dbDir;
         this.versions = versions;
         this.activeMemTable = mt;
@@ -105,6 +113,7 @@ public final class RocksDb implements KvEngine {
         this.blockCache = blockCache;
         this.compactionExecutor = compactionExecutor;
         this.rateLimiter = rateLimiter;
+        this.kvChecksumEnabled = kvChecksumEnabled;
     }
 
     /**
@@ -115,41 +124,46 @@ public final class RocksDb implements KvEngine {
      * separately by {@link #recoverWal(Path)} — wired up in CP 9.
      */
     public static RocksDb open(Path dbDir) throws IOException {
-        return open(dbDir, true, new LruBlockCache(Constants.BLOCK_CACHE_DEFAULT_BYTES), 1, null);
+        return open(dbDir, true, new LruBlockCache(Constants.BLOCK_CACHE_DEFAULT_BYTES), 1, null, false);
     }
 
     public static RocksDb open(Path dbDir, boolean compressOutput) throws IOException {
-        return open(dbDir, compressOutput, new LruBlockCache(Constants.BLOCK_CACHE_DEFAULT_BYTES), 1, null);
+        return open(dbDir, compressOutput, new LruBlockCache(Constants.BLOCK_CACHE_DEFAULT_BYTES), 1, null, false);
     }
 
     public static RocksDb open(Path dbDir, boolean compressOutput, BlockCache blockCache)
         throws IOException {
-        return open(dbDir, compressOutput, blockCache, 1, null);
+        return open(dbDir, compressOutput, blockCache, 1, null, false);
     }
 
     public static RocksDb open(Path dbDir, boolean compressOutput, BlockCache blockCache,
                                 int compactionThreads)
         throws IOException {
-        return open(dbDir, compressOutput, blockCache, compactionThreads, null);
+        return open(dbDir, compressOutput, blockCache, compactionThreads, null, false);
+    }
+
+    public static RocksDb open(Path dbDir, boolean compressOutput, BlockCache blockCache,
+                                int compactionThreads, RateLimiter rateLimiter)
+        throws IOException {
+        return open(dbDir, compressOutput, blockCache, compactionThreads, rateLimiter, false);
     }
 
     /**
      * Open the engine with an explicit {@link BlockCache}, a fixed-size pool
-     * of compaction worker threads, and an optional {@link RateLimiter} that
-     * paces every compaction worker's block writes at {@link Priority#LOW}.
+     * of compaction worker threads, an optional {@link RateLimiter} for
+     * compaction I/O at {@link Priority#LOW}, and an opt-in KV checksum.
      *
-     * <p>With {@code compactionThreads = 1} the engine behaves like LevelDB
-     * 2011 (one job at a time); with {@code compactionThreads > 1} the
-     * {@link com.hkg.rocksdb.compaction.LeveledCompactionPicker#pickMultiple
-     * picker} chooses several non-overlapping jobs that workers execute in
-     * parallel. With {@code rateLimiter = null}, compaction I/O runs
-     * un-throttled (LevelDB-era behaviour).
-     *
-     * <p>The cache, executor, and rate limiter are per-engine; cross-instance
-     * sharing of the rate limiter (RocksDB plan CP 24) is out of scope here.
+     * <p>With {@code kvChecksumEnabled = true}, every value flowing through
+     * the engine is wrapped at put time with a 4-byte CRC32 over (seq,
+     * userKey, value); the wrap is verified + stripped at get time. This is
+     * the FAST 2021 §5 end-to-end checksum: catches above-block corruption
+     * (RAM bit rot, cache poisoning) that the block-CRC layer cannot.
+     * Storage layers (WAL, MemTable, SSTable, block cache, compaction) are
+     * unmodified — they see opaque bytes that happen to be 4 bytes longer.
      */
     public static RocksDb open(Path dbDir, boolean compressOutput, BlockCache blockCache,
-                                int compactionThreads, RateLimiter rateLimiter)
+                                int compactionThreads, RateLimiter rateLimiter,
+                                boolean kvChecksumEnabled)
         throws IOException {
         Files.createDirectories(dbDir);
         boolean freshDb = !Files.exists(dbDir.resolve("CURRENT"));
@@ -202,7 +216,8 @@ public final class RocksDb implements KvEngine {
         AtomicLong seq = new AtomicLong(maxSeq + 1L);
         CompactionExecutor executor = new CompactionExecutor(compactionThreads);
         RocksDb db = new RocksDb(dbDir, vs, recoveredMt, wal,
-            new FileNumber(walNum), tables, seq, compressOutput, blockCache, executor, rateLimiter);
+            new FileNumber(walNum), tables, seq, compressOutput, blockCache, executor,
+            rateLimiter, kvChecksumEnabled);
 
         // If we recovered any in-memory state, persist it as an L0 SSTable so the old WAL
         // can be safely deleted. doFlush() opens a fresh WAL of its own and deletes the
@@ -248,9 +263,14 @@ public final class RocksDb implements KvEngine {
         synchronized (writeLock) {
             try {
                 long seq = nextSequence.getAndIncrement();
-                MutationRecord.Put put = new MutationRecord.Put(key, value, new SequenceNumber(seq));
+                // CP 21 — wrap with a KV checksum if enabled. The wrapped bytes flow opaque
+                // through WAL, MemTable, SSTable, block cache, compaction; unwrapped at get().
+                Slice storedValue = kvChecksumEnabled
+                    ? Slice.of(KvChecksumCodec.wrap(key.bytes(), value.toBytes()))
+                    : value;
+                MutationRecord.Put put = new MutationRecord.Put(key, storedValue, new SequenceNumber(seq));
                 walWriter.append(MutationCodec.encode(put));
-                activeMemTable.put(key, value, new SequenceNumber(seq));
+                activeMemTable.put(key, storedValue, new SequenceNumber(seq));
                 maybeFlush();
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
@@ -308,12 +328,25 @@ public final class RocksDb implements KvEngine {
     public Optional<Slice> get(Key key) {
         long current = nextSequence.get();
         SequenceNumber asOf = current > 0 ? new SequenceNumber(current - 1) : SequenceNumber.ZERO;
-        return readAt(key, asOf);
+        return readAt(key, asOf).map(v -> unwrapKvChecksumIfNeeded(key, v));
     }
 
     @Override
     public Optional<Slice> get(Key key, Snapshot snapshot) {
-        return readAt(key, snapshot.sequence());
+        return readAt(key, snapshot.sequence()).map(v -> unwrapKvChecksumIfNeeded(key, v));
+    }
+
+    /**
+     * CP 21 — if KV checksum is enabled, verify and strip the trailing 4-byte
+     * CRC32 before exposing the value to the application. A mismatch throws
+     * {@link com.hkg.rocksdb.integrity.KvChecksumMismatchException} — in CP 22
+     * this will be classified as HARD_ERROR_READ_ONLY and trip the engine's
+     * read-only latch.
+     */
+    private Slice unwrapKvChecksumIfNeeded(Key key, Slice wrapped) {
+        if (!kvChecksumEnabled) return wrapped;
+        byte[] stripped = KvChecksumCodec.unwrap(key.bytes(), wrapped.toBytes());
+        return Slice.of(stripped);
     }
 
     private Optional<Slice> readAt(Key key, SequenceNumber asOf) {
@@ -489,7 +522,14 @@ public final class RocksDb implements KvEngine {
             w.finish();
         }
         long fileSize = Files.size(tablePath);
-        FileMetadata fm = new FileMetadata(tableFn, fileSize, smallest, largest);
+        // CP 19 — compute the §5 file-level XXH64 over every byte of the
+        // freshly written SSTable. Catches whole-file corruption that the
+        // per-block CRC cannot see (footer bit-flip, truncation, mis-attribution).
+        // Computed AFTER w.finish() and BEFORE we record the VersionEdit so the
+        // checksum in MANIFEST always describes the bytes that are on disk now.
+        com.hkg.rocksdb.integrity.FileChecksum fileCk =
+            com.hkg.rocksdb.integrity.FileChecksum.compute(tablePath);
+        FileMetadata fm = new FileMetadata(tableFn, fileSize, smallest, largest, fileCk);
 
         // Apply VersionEdits: bump nextFileNumber past tableNum, register the new L0 file,
         // set the new active WAL, persist lastSequence.
@@ -753,6 +793,11 @@ public final class RocksDb implements KvEngine {
     /** Rate limiter pacing compaction I/O, or {@code null} if no throttling is configured. */
     public RateLimiter rateLimiter() {
         return rateLimiter;
+    }
+
+    /** True iff this engine wraps stored values with a KV checksum (CP 21). */
+    public boolean kvChecksumEnabled() {
+        return kvChecksumEnabled;
     }
 
     /**

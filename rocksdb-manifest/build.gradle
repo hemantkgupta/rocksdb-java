@@ -1,0 +1,8 @@
+// rocksdb-manifest: VersionEdit / Version / VersionSet + MANIFEST log.
+//
+// CP 19 adds a dependency on rocksdb-integrity so FileMetadata can carry
+// the §5 file-level XXH64 checksum. (Root build.gradle still wires the
+// rocksdb-common + rocksdb-wal dependencies.)
+dependencies {
+    api project(':rocksdb-integrity')
+}

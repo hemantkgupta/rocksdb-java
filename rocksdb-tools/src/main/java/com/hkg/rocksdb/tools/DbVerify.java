@@ -1,6 +1,7 @@
 package com.hkg.rocksdb.tools;
 
 import com.hkg.rocksdb.common.FileNumber;
+import com.hkg.rocksdb.integrity.FileChecksum;
 import com.hkg.rocksdb.manifest.FileMetadata;
 import com.hkg.rocksdb.manifest.Version;
 import com.hkg.rocksdb.manifest.VersionSet;
@@ -16,15 +17,25 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * Operator tool: open the active MANIFEST and walk every referenced SSTable
- * block-by-block, verifying the block-CRC32 of each block. The walk uses
- * {@link BlockBasedTableReader#entries()}, which threads every data block
- * through {@code readBlock} — a mismatch surfaces as
- * {@link BlockChecksumMismatchException} and is reported per file.
+ * Operator tool: open the active MANIFEST and walk every referenced SSTable,
+ * verifying both layers of the §5 four-layer integrity model that live on
+ * disk:
+ * <ol>
+ *   <li><b>Block CRC32</b> — per data block. The walk uses
+ *       {@link BlockBasedTableReader#entries()}, which threads every data
+ *       block through {@code readBlock} — a mismatch surfaces as
+ *       {@link BlockChecksumMismatchException}.</li>
+ *   <li><b>File XXH64</b> (CP 19) — recomputed across every byte of the
+ *       SSTable file and compared against the value recorded in
+ *       {@link FileMetadata}. Catches above-block corruption that block
+ *       CRC cannot see (footer bit-flip, truncation, file mis-attribution).
+ *       Skipped when the MANIFEST entry has no stored checksum
+ *       (legacy pre-CP-19 SSTable).</li>
+ * </ol>
  *
- * <p>This is RocksDb's single integrity layer; CP 11's verifier is the
- * operator's only way to confirm on-disk SSTables are still readable
- * without running the engine.
+ * <p>This is the operator's only way to confirm on-disk SSTables are still
+ * readable without running the engine. A single failing layer flips the
+ * per-file {@link FileResult} to FAIL with the layer-specific detail.
  */
 public final class DbVerify {
 
@@ -49,7 +60,7 @@ public final class DbVerify {
                 for (FileMetadata fm : v.level(level)) {
                     filesScanned++;
                     Path tablePath = dbDir.resolve(fm.fileNumber().tableFileName());
-                    FileResult r = verifyOne(tablePath, level, fm.fileNumber());
+                    FileResult r = verifyOne(tablePath, level, fm);
                     perFile.add(r);
                     blocksScanned += r.blockCount();
                     if (!r.ok()) failures++;
@@ -59,7 +70,8 @@ public final class DbVerify {
         return new Report(filesScanned, blocksScanned, failures, perFile);
     }
 
-    private static FileResult verifyOne(Path path, int level, FileNumber fn) {
+    private static FileResult verifyOne(Path path, int level, FileMetadata fm) {
+        FileNumber fn = fm.fileNumber();
         long blockCount = 0L;
         try (BlockBasedTableReader r = BlockBasedTableReader.open(path)) {
             Iterator<BlockBasedTableReader.SsTableEntry> it = r.entries();
@@ -67,7 +79,6 @@ public final class DbVerify {
                 it.next();
                 blockCount++;
             }
-            return FileResult.pass(level, fn, blockCount);
         } catch (BlockChecksumMismatchException e) {
             return FileResult.fail(level, fn, blockCount, "block CRC mismatch: " + e.getMessage());
         } catch (SsTableFormatException e) {
@@ -80,6 +91,28 @@ public final class DbVerify {
             return FileResult.fail(level, fn, blockCount, cause.getClass().getSimpleName()
                 + ": " + cause.getMessage());
         }
+
+        // ----- CP 19: file-level XXH64 pass -----
+        // Recompute over every byte of the SSTable and compare against the
+        // value stored in FileMetadata. Skipped when the MANIFEST entry
+        // predates CP 19 (no stored checksum) — pre-19 files verify clean
+        // against block-CRC alone, matching the old contract.
+        FileChecksum stored = fm.fileChecksum();
+        if (stored != null) {
+            try {
+                FileChecksum actual = FileChecksum.compute(path);
+                if (actual.value() != stored.value()) {
+                    return FileResult.fail(level, fn, blockCount,
+                        String.format("file checksum mismatch: stored=0x%016x actual=0x%016x",
+                            stored.value(), actual.value()));
+                }
+            } catch (IOException e) {
+                return FileResult.fail(level, fn, blockCount,
+                    "file checksum I/O error: " + e.getMessage());
+            }
+        }
+
+        return FileResult.pass(level, fn, blockCount);
     }
 
     /** Outcome of verifying one SSTable. */
