@@ -43,12 +43,15 @@ public final class BlockBasedTableReader implements Closeable {
     private final BloomFilter bloomFilter;
     private final FileNumber fileNumber;
     private final BlockCache cache;
+    /** CP 25 — DB-scoped namespace for cache keys; null when no cache or single-instance. */
+    private final String dbId;
     /** CP 17 — range tombstones loaded eagerly at open time; empty list for older SSTables. */
     private final List<RangeTombstone> rangeTombstones;
 
     private BlockBasedTableReader(FileChannel channel, long fileSize, Footer footer,
                                    Block indexBlock, BloomFilter bloomFilter,
                                    FileNumber fileNumber, BlockCache cache,
+                                   String dbId,
                                    List<RangeTombstone> rangeTombstones) {
         this.channel = channel;
         this.fileSize = fileSize;
@@ -57,6 +60,7 @@ public final class BlockBasedTableReader implements Closeable {
         this.bloomFilter = bloomFilter;
         this.fileNumber = fileNumber;
         this.cache = cache;
+        this.dbId = dbId;
         this.rangeTombstones = rangeTombstones;
     }
 
@@ -73,6 +77,18 @@ public final class BlockBasedTableReader implements Closeable {
      */
     public static BlockBasedTableReader open(Path path, FileNumber fileNumber, BlockCache cache)
         throws IOException {
+        return open(path, fileNumber, cache, null);
+    }
+
+    /**
+     * CP 25 — open with an explicit {@code dbId} namespace for cache keys. When
+     * the cache is shared across multiple engine instances (RocksDB plan §1.1
+     * goal #6), each engine passes its own id so two engines whose fresh file
+     * numbers both start at 1 don't collide on cache lookups.
+     */
+    public static BlockBasedTableReader open(Path path, FileNumber fileNumber, BlockCache cache,
+                                              String dbId)
+        throws IOException {
         FileChannel ch = FileChannel.open(path, StandardOpenOption.READ);
         long size = ch.size();
         if (size < Footer.ENCODED_LENGTH) {
@@ -87,7 +103,7 @@ public final class BlockBasedTableReader implements Closeable {
         // Bootstrap reader without the cache — the index/bloom blocks are loaded directly,
         // skipping the cache (they would just churn it on open and they're already in-memory).
         BlockBasedTableReader bootstrap = new BlockBasedTableReader(
-            ch, size, footer, null, null, fileNumber, null, List.of());
+            ch, size, footer, null, null, fileNumber, null, null, List.of());
 
         byte[] indexBytes = bootstrap.readBlockDirect(footer.indexHandle());
         Block indexBlock = new Block(indexBytes);
@@ -98,7 +114,7 @@ public final class BlockBasedTableReader implements Closeable {
         // CP 17 — range tombstones meta-block, absent in pre-CP-17 SSTables.
         List<RangeTombstone> rts = loadRangeTombstones(bootstrap, metaIndex);
 
-        return new BlockBasedTableReader(ch, size, footer, indexBlock, bloom, fileNumber, cache, rts);
+        return new BlockBasedTableReader(ch, size, footer, indexBlock, bloom, fileNumber, cache, dbId, rts);
     }
 
     /**
@@ -255,7 +271,7 @@ public final class BlockBasedTableReader implements Closeable {
      */
     byte[] readBlock(BlockHandle handle) throws IOException {
         if (cache != null && fileNumber != null) {
-            CacheKey ck = new CacheKey(fileNumber, handle.offset());
+            CacheKey ck = new CacheKey(dbId, fileNumber, handle.offset());
             return cache.lookupOrLoad(ck, () -> readBlockDirect(handle));
         }
         return readBlockDirect(handle);
